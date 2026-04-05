@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app.accounts import AccountService
 from app.bridge import AppApi, DesktopBridge
+from app.config import APP_VERSION
 from app.database import close_database, init_database
 
 
@@ -92,6 +93,12 @@ class AppApiModelActionTests(unittest.TestCase):
         mocked_download.assert_called_once_with(8)
         self.assertEqual(payload["taskId"], 8)
         self.assertEqual(payload["downloadPath"], "/tmp/demo.mp4")
+
+    def test_get_app_state_includes_version(self) -> None:
+        payload = self.api.get_app_state()
+
+        self.assertEqual(payload["version"], APP_VERSION)
+        self.assertEqual(payload["title"], "Test")
 
 
 if __name__ == "__main__":

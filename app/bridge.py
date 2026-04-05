@@ -12,6 +12,7 @@ import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
 
 from app.accounts import AccountService
+from app.config import APP_VERSION
 from app.huasheng import HuaShengAutomation
 from app.microheadline import MicroHeadlineService
 
@@ -40,6 +41,7 @@ class DesktopBridge:
         with self._lock:
             return {
                 "title": self.window.title if self.window else self.default_title,
+                "version": APP_VERSION,
                 "lastAction": self._last_action,
                 "messageCount": len(self._messages),
                 "startedAt": self.started_at.isoformat(),

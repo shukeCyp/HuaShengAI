@@ -92,6 +92,7 @@ const DEFAULT_SUBTITLE_STYLE_OPTIONS = [
 ]
 
 const desktopReady = ref(false)
+const appVersion = ref('')
 const loading = ref(false)
 const saving = ref(false)
 const busyAccountId = ref(null)
@@ -567,6 +568,11 @@ const huashengVoiceSummary = computed(() => {
 const globalSettingsSummary = computed(() => {
   const downloadLabel = globalSettings.downloadDir ? '已设置下载目录' : '未设置下载目录'
   return `线程池 ${Number(globalSettings.threadPoolSize || DEFAULT_GLOBAL_SETTINGS.threadPoolSize)} 个线程 · ${downloadLabel}`
+})
+
+const displayAppVersion = computed(() => {
+  const normalized = String(appVersion.value || '').trim()
+  return normalized ? `v${normalized}` : '待连接'
 })
 
 const voicePickerTitle = computed(() => {
@@ -1057,6 +1063,25 @@ function applyGlobalSettingsPayload(payload) {
 
   if (payload?.databasePath) {
     databasePath.value = payload.databasePath
+  }
+}
+
+function applyAppStatePayload(payload) {
+  appVersion.value = String(payload?.version || '').trim()
+}
+
+async function loadAppState() {
+  if (!desktopReady.value) {
+    return null
+  }
+
+  try {
+    const payload = await callDesktop('get_app_state')
+    applyAppStatePayload(payload)
+    return payload
+  } catch {
+    appVersion.value = ''
+    return null
   }
 }
 
@@ -2605,6 +2630,7 @@ async function bindPyWebView() {
   desktopReady.value = hasDesktopApi()
 
   if (desktopReady.value) {
+    await loadAppState()
     await loadAccounts('账号列表已载入')
     const tasksPayload = await loadTasks('任务列表已载入', { silent: true })
     const globalPayload = await loadGlobalSettings('全局设置已载入')
@@ -2700,7 +2726,7 @@ watch(selectedTtsVoiceId, (value) => {
         <p class="sidebar-note">
           参考微头条控制台的线性后台风格，保留本地桌面账号管理交互。
         </p>
-        <p class="sidebar-version">HuaShengAI v1.0.0</p>
+        <p class="sidebar-version">HuaShengAI {{ displayAppVersion }}</p>
       </div>
     </aside>
 
@@ -3745,6 +3771,11 @@ watch(selectedTtsVoiceId, (value) => {
                   <span>下载目录</span>
                   <strong>{{ getPathTail(globalSettings.downloadDir) }}</strong>
                   <small>{{ globalSettings.downloadDir || '还没有保存默认下载路径' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>当前版本</span>
+                  <strong>{{ displayAppVersion }}</strong>
+                  <small>版本号由桌面后端统一提供</small>
                 </div>
                 <div class="tts-account-card">
                   <span>最近保存</span>
