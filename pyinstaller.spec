@@ -1,20 +1,45 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH).resolve()
+app_dist_name = os.environ.get("HUASHENGAI_DIST_NAME", "荷塘AI花生工具").strip() or "荷塘AI花生工具"
+playwright_browser_dir = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
 
-datas = collect_data_files("webview", subdir="js")
+datas = collect_data_files("webview")
+datas += collect_data_files("playwright")
 datas += [
     (str(project_root / "app" / "web_dist"), "app/web_dist"),
 ]
 
-hiddenimports = [
-    "webview.platforms.cocoa",
-]
+if playwright_browser_dir:
+    browser_root = Path(playwright_browser_dir)
+    if not browser_root.is_absolute():
+        browser_root = (project_root / browser_root).resolve()
+    if browser_root.exists():
+        datas.append((str(browser_root), "playwright-browsers"))
+
+hiddenimports = collect_submodules("playwright")
+if sys.platform == "darwin":
+    hiddenimports += [
+        "webview.platforms.cocoa",
+    ]
+elif sys.platform.startswith("win"):
+    hiddenimports += [
+        "webview.platforms.edgechromium",
+        "webview.platforms.winforms",
+        "webview.platforms.mshtml",
+    ]
+else:
+    hiddenimports += [
+        "webview.platforms.gtk",
+        "webview.platforms.qt",
+    ]
 
 a = Analysis(
     ["app/main.py"],
@@ -24,7 +49,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(project_root / "scripts" / "pyinstaller_runtime_playwright.py")],
     excludes=[],
     noarchive=False,
 )
@@ -35,7 +60,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="HuaShengAI",
+    name=app_dist_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -50,5 +75,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="HuaShengAI",
+    name=app_dist_name,
 )

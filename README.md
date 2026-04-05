@@ -22,6 +22,7 @@ This project uses:
 - sync Python dependencies with `uv`
 - rebuild the Vue frontend
 - refresh `app/web_dist`
+- install Playwright Chromium into a local bundle directory
 - build a desktop bundle with `PyInstaller`
 
 ## Run
@@ -36,7 +37,15 @@ This project uses:
 ./package.sh
 ```
 
-The packaged output is written to `dist/HuaShengAI/`.
+The packaged output is written to `dist/荷塘AI花生工具/`.
+
+## GitHub Actions
+
+The repository includes `.github/workflows/build-windows-exe.yml`.
+
+- every push to `main` / `master` triggers a Windows build
+- the workflow installs Playwright Chromium into the bundle
+- the uploaded artifacts are named `荷塘AI花生工具-windows-dir` and `荷塘AI花生工具-windows-zip`
 
 ## Override the frontend target directory
 

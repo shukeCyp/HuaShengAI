@@ -3,6 +3,8 @@ set -eu
 
 PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 WEB_DIST_DIR="${WEB_DIST_DIR:-$PROJECT_ROOT/app/web_dist}"
+PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$PROJECT_ROOT/playwright-browsers}"
+HUASHENGAI_DIST_NAME="${HUASHENGAI_DIST_NAME:-荷塘AI花生工具}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -23,4 +25,10 @@ WEB_DIST_DIR="$WEB_DIST_DIR" \
   "$PROJECT_ROOT/scripts/build_frontend.sh"
 
 printf '==> Build desktop bundle with PyInstaller\n'
-uv run --with pyinstaller pyinstaller --noconfirm --clean "$PROJECT_ROOT/pyinstaller.spec"
+printf '==> Install Playwright Chromium into %s\n' "$PLAYWRIGHT_BROWSERS_PATH"
+PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+  uv run python -m playwright install chromium
+
+PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+HUASHENGAI_DIST_NAME="$HUASHENGAI_DIST_NAME" \
+  uv run --with pyinstaller pyinstaller --noconfirm --clean "$PROJECT_ROOT/pyinstaller.spec"
