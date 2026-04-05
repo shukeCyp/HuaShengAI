@@ -78,6 +78,128 @@ class AppApiModelActionTests(unittest.TestCase):
         self.assertEqual(payload["responseText"], "连接成功")
         self.assertEqual(payload["requestUrl"], "https://api.example.com/v1/chat/completions")
 
+    def test_ocr_image_text_returns_error_payload_instead_of_raising(self) -> None:
+        with patch.object(
+            self.service,
+            "ocr_image_text",
+            side_effect=RuntimeError("未安装 PaddleOCR 运行依赖"),
+        ):
+            payload = self.api.ocr_image_text("/tmp/demo.png")
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["errorMessage"], "未安装 PaddleOCR 运行依赖")
+        self.assertEqual(payload["imagePath"], "/tmp/demo.png")
+        self.assertEqual(payload["model"], "PaddleOCR")
+
+    def test_ocr_image_text_wraps_success_payload(self) -> None:
+        with patch.object(
+            self.service,
+            "ocr_image_text",
+            return_value={
+                "engine": "PaddleOCR",
+                "imagePath": "/tmp/demo.png",
+                "lineCount": 2,
+                "text": "第一行\n第二行",
+                "lines": [{"text": "第一行"}, {"text": "第二行"}],
+            },
+        ):
+            payload = self.api.ocr_image_text("/tmp/demo.png")
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["errorMessage"], "")
+        self.assertEqual(payload["lineCount"], 2)
+        self.assertEqual(payload["text"], "第一行\n第二行")
+
+    def test_get_ocr_model_status_wraps_success_payload(self) -> None:
+        with patch.object(
+            self.service,
+            "get_ocr_model_status_payload",
+            return_value={
+                "engine": "PaddleOCR",
+                "status": "ready",
+                "ready": True,
+                "message": "OCR 模型已就绪",
+                "cacheDir": "/tmp/paddlex",
+            },
+        ) as mocked_status:
+            payload = self.api.get_ocr_model_status()
+
+        mocked_status.assert_called_once_with()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["status"], "ready")
+        self.assertTrue(payload["ready"])
+
+    def test_download_ocr_model_returns_error_payload_instead_of_raising(self) -> None:
+        with patch.object(
+            self.service,
+            "download_ocr_models",
+            side_effect=RuntimeError("OCR 模型正在下载或校验中，请稍后再试。"),
+        ):
+            payload = self.api.download_ocr_model()
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["errorMessage"], "OCR 模型正在下载或校验中，请稍后再试。")
+        self.assertEqual(payload["model"], "PaddleOCR")
+
+    def test_select_image_file_delegates_to_bridge(self) -> None:
+        with patch.object(self.bridge, "choose_file", return_value="/tmp/image.png") as mocked_choose:
+            payload = self.api.select_image_file("/tmp/current.jpg")
+
+        mocked_choose.assert_called_once()
+        self.assertEqual(payload["selectedPath"], "/tmp/image.png")
+        self.assertFalse(payload["cancelled"])
+
+    def test_save_global_settings_delegates_to_service_with_website_check_flag(self) -> None:
+        with patch.object(
+            self.service,
+            "save_global_settings",
+            return_value={
+                "settings": {
+                    "threadPoolSize": 6,
+                    "downloadDir": "/tmp/downloads",
+                    "checkWebsiteLinks": True,
+                }
+            },
+        ) as mocked_save:
+            payload = self.api.save_global_settings(6, "/tmp/downloads", True)
+
+        mocked_save.assert_called_once_with(6, "/tmp/downloads", True)
+        self.assertTrue(payload["settings"]["checkWebsiteLinks"])
+
+    def test_save_huasheng_voice_settings_delegates_to_service_with_concurrency_limit(self) -> None:
+        with patch.object(
+            self.service,
+            "save_huasheng_voice_settings",
+            return_value={
+                "settings": {
+                    "voiceId": 6036542,
+                    "maxConcurrentTasksPerAccount": 2,
+                }
+            },
+        ) as mocked_save:
+            payload = self.api.save_huasheng_voice_settings(
+                6036542,
+                "知性女声",
+                "voice-code",
+                "科普",
+                "https://example.com/preview.mp3",
+                "https://example.com/cover.png",
+                1.2,
+                2,
+            )
+
+        mocked_save.assert_called_once_with(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.2,
+            2,
+        )
+        self.assertEqual(payload["settings"]["maxConcurrentTasksPerAccount"], 2)
+
     def test_download_task_video_delegates_to_service(self) -> None:
         with patch.object(
             self.service,
@@ -93,6 +215,22 @@ class AppApiModelActionTests(unittest.TestCase):
         mocked_download.assert_called_once_with(8)
         self.assertEqual(payload["taskId"], 8)
         self.assertEqual(payload["downloadPath"], "/tmp/demo.mp4")
+
+    def test_retry_task_record_delegates_to_service(self) -> None:
+        with patch.object(
+            self.service,
+            "retry_task_record",
+            return_value={
+                "id": 9,
+                "status": "待处理",
+                "projectPid": "",
+            },
+        ) as mocked_retry:
+            payload = self.api.retry_task_record(9)
+
+        mocked_retry.assert_called_once_with(9)
+        self.assertEqual(payload["id"], 9)
+        self.assertEqual(payload["status"], "待处理")
 
     def test_get_app_state_includes_version(self) -> None:
         payload = self.api.get_app_state()

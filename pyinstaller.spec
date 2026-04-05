@@ -31,6 +31,11 @@ if playwright_browser_dir:
         datas.append((str(browser_root), "playwright-browsers"))
 
 hiddenimports = collect_submodules("playwright")
+try:
+    datas += collect_data_files("paddleocr")
+    hiddenimports += collect_submodules("paddleocr")
+except Exception:
+    pass
 if sys.platform == "darwin":
     hiddenimports += [
         "webview.platforms.cocoa",

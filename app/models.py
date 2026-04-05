@@ -54,6 +54,7 @@ class TaskRecord(BaseModel):
     account_cookies = TextField(default="")
     project_pid = CharField(max_length=64, default="", index=True)
     article_id = IntegerField(null=True, index=True)
+    article_content = TextField(default="")
     rewritten_content = TextField(default="")
     title = TextField(default="")
     rewrite_prompt_id = IntegerField(null=True)

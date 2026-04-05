@@ -1,10 +1,12 @@
 [project]
 name = "huashengai-desktop"
-version = "1.0.0"
+version = "1.0.1"
 description = "PyWebView desktop shell with a Vue frontend"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "paddleocr>=3,<4",
+    "paddlepaddle>=3,<4",
     "peewee>=3.17.9,<4",
     "playwright>=1.55,<2",
     "pywebview>=6.0",

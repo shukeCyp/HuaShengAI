@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 import html
+import importlib
+import inspect
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -20,8 +24,10 @@ from app.huasheng import HuaShengAutomation
 from app.models import (
     Account,
     AppSetting,
+    BenchmarkAccount,
     HuashengGenerationRecord,
     MonitoredArticle,
+    MonitorRun,
     RewritePrompt,
     TaskRecord,
 )
@@ -103,6 +109,7 @@ DEFAULT_MODEL_SETTINGS = {
 DEFAULT_GLOBAL_SETTINGS = {
     "threadPoolSize": 3,
     "downloadDir": "",
+    "checkWebsiteLinks": False,
 }
 DEFAULT_HUASHENG_VOICE_SETTINGS = {
     "voiceId": 0,
@@ -112,6 +119,27 @@ DEFAULT_HUASHENG_VOICE_SETTINGS = {
     "previewUrl": "",
     "cover": "",
     "speechRate": 1,
+    "maxConcurrentTasksPerAccount": 1,
+}
+SUPPORTED_IMAGE_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".webp",
+    ".tif",
+    ".tiff",
+}
+OCR_ENGINE_NAME = "PaddleOCR"
+OCR_MODEL_READY_MARKER_FILENAME = ".ocr-model-ready.json"
+OCR_MODEL_SIGNATURE_SUFFIXES = {
+    ".pdmodel",
+    ".pdiparams",
+    ".onnx",
+}
+OCR_MODEL_SIGNATURE_FILENAMES = {
+    "inference.yml",
+    "inference.yaml",
 }
 MODEL_REQUEST_TIMEOUT = 60.0
 REWRITE_MODEL_REQUEST_TIMEOUT = 20 * 60.0
@@ -119,6 +147,7 @@ TITLE_MODEL_REQUEST_TIMEOUT = 20 * 60.0
 VIDEO_DOWNLOAD_TIMEOUT = 300.0
 VIDEO_DOWNLOAD_MAX_RETRIES = 3
 VIDEO_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+COVER_IMAGE_DOWNLOAD_TIMEOUT = 20.0
 MODEL_REQUEST_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -129,7 +158,9 @@ REWRITE_OUTPUT_FORMAT_PROMPT = (
     "1. 只返回改写后的正文内容，不要返回解释、标题、前言、总结或其他额外说明。\n"
     "2. 严格按照下面格式返回：\n"
     "############content\n"
-    "这里填写改写后的正文内容"
+    "这里填写改写后的正文内容\n"
+    "3. 如果触发红线，只允许原样返回下面这一行，不要加标题、代码块、解释、引号、空行或其他任何字符：\n"
+    "######触发红线，禁止改写"
 )
 TITLE_OUTPUT_FORMAT_PROMPT = (
     "输出要求：\n"
@@ -143,11 +174,15 @@ MODEL_CONNECTION_TEST_USER_CONTENT = "请返回连接成功。"
 TASK_QUEUE_SCAN_INTERVAL_SECONDS = 5
 TASK_THREAD_POOL_MIN_SIZE = 1
 TASK_THREAD_POOL_MAX_SIZE = 32
+TASK_STAGE_MAX_RETRIES = 3
 HUASHENG_DAILY_PROJECT_LIMIT = 50
+HUASHENG_DAILY_LIMIT_REACHED_CODE = 10008
+HUASHENG_GENERATION_PLACEHOLDER_PREFIX = "quota-placeholder"
 TASK_STATUS_PENDING = "待处理"
 TASK_STATUS_REWRITE_RUNNING = "S1改写中"
 TASK_STATUS_REWRITE_READY = "待生成标题"
 TASK_STATUS_REWRITE_FAILED = "S1失败"
+TASK_STATUS_REWRITE_REDLINE = "触发红线"
 TASK_STATUS_TITLE_RUNNING = "S2标题中"
 TASK_STATUS_READY_FOR_HUASHENG = "待创建花生任务"
 TASK_STATUS_TITLE_FAILED = "S2失败"
@@ -162,10 +197,35 @@ TASK_HUASHENG_STATUS_NOT_CREATED = "未创建"
 TASK_HUASHENG_STATUS_CREATED = "任务已创建"
 TASK_HUASHENG_STATUS_EXPORT_READY = "准备导出"
 TASK_HUASHENG_STATUS_EXPORT_FINISHED = "导出完成"
+TASK_HUASHENG_STATUS_WEBSITE_LINK_BLOCKED = "触发网站链接限制"
+TASK_HUASHENG_STATUS_WAIT_FOR_AVAILABLE_ACCOUNT = "暂无可用花生账号，等待下次扫描"
 TASK_STAGE_REWRITE = "rewrite"
 TASK_STAGE_TITLE = "title"
 TASK_STAGE_HUASHENG_CREATE = "huasheng_create"
 TASK_STAGE_HUASHENG_PROGRESS = "huasheng_progress"
+REWRITE_REDLINE_RESPONSE_TEXT = "######触发红线，禁止改写"
+REWRITE_REDLINE_DISPLAY_TEXT = "触发红线，禁止改写"
+REWRITE_REDLINE_FUZZY_KEYWORDS = (
+    "触发安全机制",
+    "题材受限",
+    "停止改写",
+)
+TASK_HUASHENG_STATUS_ACCOUNT_RETRY = "账号限额，等待重新分配"
+HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MIN = 1
+HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MAX = 50
+WEBSITE_LINK_PATTERN = re.compile(
+    r"(?i)(?:\b(?:https?|ftp)://[^\s]+|(?<![@A-Za-z0-9_])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?::\d{1,5})?(?:/[^\s]*)?(?=$|[^A-Za-z0-9_]))"
+)
+WEBSITE_LINK_TEXT_TRANSLATION = str.maketrans(
+    {
+        "。": ".",
+        "．": ".",
+        "｡": ".",
+        "／": "/",
+        "∕": "/",
+        "：": ":",
+    }
+)
 
 
 logger = logging.getLogger(__name__)
@@ -173,6 +233,10 @@ logger = logging.getLogger(__name__)
 
 def now_local() -> datetime:
     return datetime.now().replace(microsecond=0)
+
+
+class HuashengCreateRetryRequired(RuntimeError):
+    pass
 
 
 class AccountService:
@@ -185,6 +249,9 @@ class AccountService:
         self._task_executor: ThreadPoolExecutor | None = None
         self._task_executor_size = 0
         self._huasheng_account_selection_lock = Lock()
+        self._paddle_ocr_lock = Lock()
+        self._paddle_ocr_download_lock = Lock()
+        self._paddle_ocr_engine: Any | None = None
         self._rewrite_task_ids_inflight: set[int] = set()
         self._title_task_ids_inflight: set[int] = set()
         self._huasheng_create_task_ids_inflight: set[int] = set()
@@ -199,6 +266,9 @@ class AccountService:
                     RewritePrompt,
                     TaskRecord,
                     HuashengGenerationRecord,
+                    BenchmarkAccount,
+                    MonitorRun,
+                    MonitoredArticle,
                 ],
                 safe=True,
             )
@@ -209,13 +279,20 @@ class AccountService:
             accounts = list(
                 Account.select().order_by(Account.updated_at.desc(), Account.id.desc())
             )
+        voice_settings = self.load_huasheng_voice_settings_snapshot()
+        max_concurrent_tasks_per_account = int(
+            voice_settings.get("maxConcurrentTasksPerAccount") or 1
+        )
         generation_count_map = self.build_huasheng_generation_count_map(
             [int(account.id) for account in accounts]
         )
+        active_task_count_map = self.list_huasheng_active_task_counts()
         items = [
             self.serialize_account(
                 account,
                 today_generation_count=generation_count_map.get(int(account.id), 0),
+                active_huasheng_task_count=active_task_count_map.get(int(account.id), 0),
+                max_concurrent_tasks_per_account=max_concurrent_tasks_per_account,
             )
             for account in accounts
         ]
@@ -316,7 +393,7 @@ class AccountService:
     def list_tasks_payload(self) -> dict[str, Any]:
         with database.connection_context():
             tasks = list(
-                TaskRecord.select().order_by(TaskRecord.updated_at.desc(), TaskRecord.id.desc())
+                TaskRecord.select().order_by(TaskRecord.id.desc())
             )
             article_preview_map = self.build_task_article_preview_map(tasks)
 
@@ -334,6 +411,72 @@ class AccountService:
             },
             "databasePath": str(self.db_path),
         }
+
+    def is_retryable_task_status(self, status: str) -> bool:
+        normalized_status = str(status or "").strip()
+        return normalized_status in {
+            TASK_STATUS_REWRITE_FAILED,
+            TASK_STATUS_TITLE_FAILED,
+            TASK_STATUS_HUASHENG_CREATE_FAILED,
+            TASK_STATUS_EXPORT_FAILED,
+        }
+
+    def retry_task_record(self, task_id: int) -> dict[str, Any]:
+        normalized_task_id = self.normalize_positive_int(task_id, field_name="task_id")
+        with database.connection_context():
+            task = self.get_task_record(normalized_task_id)
+            current_status = str(task.status or "").strip()
+            if not self.is_retryable_task_status(current_status):
+                raise ValueError("当前任务不是失败状态，无法重试。")
+
+            if current_status == TASK_STATUS_REWRITE_FAILED:
+                task.status = TASK_STATUS_PENDING
+                task.rewritten_content = ""
+                task.title = ""
+                task.project_pid = ""
+                task.progress = 0
+                task.video_url = ""
+                task.huasheng_status = TASK_HUASHENG_STATUS_NOT_CREATED
+                task.export_task_id = ""
+                task.export_version = ""
+            elif current_status == TASK_STATUS_TITLE_FAILED:
+                task.status = TASK_STATUS_REWRITE_READY
+                task.title = ""
+                task.project_pid = ""
+                task.progress = 0
+                task.video_url = ""
+                task.huasheng_status = TASK_HUASHENG_STATUS_NOT_CREATED
+                task.export_task_id = ""
+                task.export_version = ""
+            elif current_status == TASK_STATUS_HUASHENG_CREATE_FAILED:
+                task.status = TASK_STATUS_READY_FOR_HUASHENG
+                task.project_pid = ""
+                task.progress = 0
+                task.video_url = ""
+                task.huasheng_status = TASK_HUASHENG_STATUS_NOT_CREATED
+                task.export_task_id = ""
+                task.export_version = ""
+            else:
+                task.status = (
+                    TASK_STATUS_HUASHENG_POLLING
+                    if str(task.project_pid or "").strip()
+                    else TASK_STATUS_READY_FOR_HUASHENG
+                )
+                task.progress = 0
+                task.video_url = ""
+                task.huasheng_status = (
+                    "等待花生处理"
+                    if str(task.project_pid or "").strip()
+                    else TASK_HUASHENG_STATUS_NOT_CREATED
+                )
+                if not str(task.project_pid or "").strip():
+                    task.export_task_id = ""
+                    task.export_version = ""
+
+            task.updated_at = now_local()
+            task.save()
+
+        return self.serialize_task_record(task)
 
     def delete_all_task_records(self) -> dict[str, Any]:
         with self._task_processor_state_lock:
@@ -447,6 +590,7 @@ class AccountService:
         project_pid: str = "",
         status: str = "处理中",
         article_id: int | None = None,
+        article_content: str = "",
         rewrite_prompt_id: int | None = None,
         rewrite_prompt: str = "",
         rewritten_content: str = "",
@@ -473,6 +617,11 @@ class AccountService:
             max_length=64,
         )
         normalized_article_id = self.normalize_optional_positive_int(article_id)
+        normalized_article_content = self.normalize_text_field(
+            article_content,
+            field_name="文章内容快照",
+            max_length=200000,
+        )
         normalized_rewrite_prompt_id = self.normalize_optional_positive_int(rewrite_prompt_id)
         normalized_rewrite_prompt = self.normalize_text_field(
             rewrite_prompt,
@@ -547,6 +696,7 @@ class AccountService:
                     account_cookies=normalized_account_cookies,
                     project_pid=normalized_project_pid,
                     article_id=normalized_article_id or None,
+                    article_content=normalized_article_content,
                     rewritten_content=normalized_rewritten_content,
                     title=normalized_title,
                     rewrite_prompt_id=normalized_rewrite_prompt_id or None,
@@ -567,6 +717,7 @@ class AccountService:
                 task.account_cookies = normalized_account_cookies
                 task.project_pid = normalized_project_pid
                 task.article_id = normalized_article_id or None
+                task.article_content = normalized_article_content
                 task.rewritten_content = normalized_rewritten_content
                 task.title = normalized_title
                 task.rewrite_prompt_id = normalized_rewrite_prompt_id or None
@@ -741,7 +892,28 @@ class AccountService:
         timestamp = now_local()
 
         with database.connection_context():
+            if not database.table_exists(MonitoredArticle._meta.table_name):
+                raise ValueError("文章表不存在，请先抓取文章后再处理。")
             account = self.get_default_task_account()
+            articles = list(
+                MonitoredArticle.select(
+                    MonitoredArticle.id,
+                    MonitoredArticle.content,
+                    MonitoredArticle.title,
+                ).where(
+                    MonitoredArticle.id.in_(normalized_article_ids),
+                    MonitoredArticle.isdelete == 0,
+                )
+            )
+            article_map = {
+                int(article.id): str(article.content or article.title or "").strip()
+                for article in articles
+            }
+            available_article_ids = [
+                article_id for article_id in normalized_article_ids if article_id in article_map
+            ]
+            if not available_article_ids:
+                raise ValueError("当前没有可处理的文章。")
             prompts = list(
                 RewritePrompt.select().where(RewritePrompt.id.in_(normalized_prompt_ids))
             )
@@ -758,7 +930,8 @@ class AccountService:
 
             created_items: list[dict[str, Any]] = []
             with database.atomic():
-                for article_id in normalized_article_ids:
+                for article_id in available_article_ids:
+                    article_content = article_map.get(article_id, "")
                     for prompt_id in normalized_prompt_ids:
                         prompt = prompt_map[prompt_id]
                         task = TaskRecord.create(
@@ -768,6 +941,7 @@ class AccountService:
                             account_cookies=account.cookies,
                             project_pid="",
                             article_id=article_id,
+                            article_content=article_content,
                             rewritten_content="",
                             title="",
                             rewrite_prompt_id=prompt.id,
@@ -782,12 +956,17 @@ class AccountService:
                             updated_at=timestamp,
                         )
                         created_items.append(self.serialize_task_record(task))
+                deleted_article_count = self.delete_monitored_articles_by_ids(
+                    available_article_ids,
+                    timestamp=timestamp,
+                )
 
         return {
             "items": created_items,
             "createdCount": len(created_items),
-            "articleCount": len(normalized_article_ids),
+            "articleCount": len(available_article_ids),
             "promptCount": len(normalized_prompt_ids),
+            "deletedArticleCount": deleted_article_count,
             "accountId": account.id,
             "databasePath": str(self.db_path),
         }
@@ -830,17 +1009,23 @@ class AccountService:
         self,
         thread_pool_size: int,
         download_dir: str | None = None,
+        check_website_links: bool | str | None = None,
     ) -> dict[str, Any]:
         settings_input: dict[str, Any] = {
             "threadPoolSize": thread_pool_size,
         }
+        existing_settings = self.get_global_settings_payload()["settings"]
         if download_dir is None:
-            settings_input["downloadDir"] = self.get_global_settings_payload()["settings"].get(
-                "downloadDir",
-                "",
-            )
+            settings_input["downloadDir"] = existing_settings.get("downloadDir", "")
         else:
             settings_input["downloadDir"] = download_dir
+        if check_website_links is None:
+            settings_input["checkWebsiteLinks"] = existing_settings.get(
+                "checkWebsiteLinks",
+                False,
+            )
+        else:
+            settings_input["checkWebsiteLinks"] = check_website_links
 
         settings = self.normalize_global_settings(settings_input)
         timestamp = now_local()
@@ -994,6 +1179,7 @@ class AccountService:
         preview_url: str,
         cover: str,
         speech_rate: float,
+        max_concurrent_tasks_per_account: int | None = None,
     ) -> dict[str, Any]:
         settings = self.normalize_huasheng_voice_settings(
             {
@@ -1004,6 +1190,7 @@ class AccountService:
                 "previewUrl": preview_url,
                 "cover": cover,
                 "speechRate": speech_rate,
+                "maxConcurrentTasksPerAccount": max_concurrent_tasks_per_account,
             }
         )
         timestamp = now_local()
@@ -1164,17 +1351,28 @@ class AccountService:
             action_name="文章改写",
             timeout=REWRITE_MODEL_REQUEST_TIMEOUT,
         )
-        content = self.normalize_rewrite_response_text(content)
-        if not content:
+        normalized_content = self.normalize_rewrite_response_text(content)
+        if self.is_rewrite_redline_response(normalized_content or content):
+            return {
+                "content": REWRITE_REDLINE_DISPLAY_TEXT,
+                "promptId": prompt_id or 0,
+                "promptContent": normalized_prompt_content,
+                "model": normalized_model,
+                "requestUrl": normalized_base_url,
+                "databasePath": str(self.db_path),
+                "triggeredRedline": True,
+            }
+        if not normalized_content:
             raise RuntimeError("文章改写失败: 模型接口返回为空。")
 
         return {
-            "content": content,
+            "content": normalized_content,
             "promptId": prompt_id or 0,
             "promptContent": normalized_prompt_content,
             "model": normalized_model,
             "requestUrl": normalized_base_url,
             "databasePath": str(self.db_path),
+            "triggeredRedline": False,
         }
 
     def build_rewrite_system_prompt(self, prompt_content: str) -> str:
@@ -1184,7 +1382,26 @@ class AccountService:
         return f"{normalized_prompt}\n\n{REWRITE_OUTPUT_FORMAT_PROMPT}"
 
     def normalize_rewrite_response_text(self, text: str) -> str:
-        return self._strip_labeled_output(text, label="content")
+        normalized = self._strip_labeled_output(text, label="content")
+        return self._strip_markdown_code_fence(normalized)
+
+    def is_rewrite_redline_response(self, text: str) -> bool:
+        normalized = self._strip_markdown_code_fence(str(text or "").strip())
+        if not normalized:
+            return False
+
+        candidates = [
+            normalized,
+            self._strip_labeled_output(normalized, label="content"),
+        ]
+        expected = "触发红线禁止改写"
+        for candidate in candidates:
+            compact = re.sub(r"[#`\s:：,，.。!！?？\"'“”‘’]+", "", str(candidate or ""))
+            if compact == expected:
+                return True
+            if any(keyword in compact for keyword in REWRITE_REDLINE_FUZZY_KEYWORDS):
+                return True
+        return False
 
     def generate_title(
         self,
@@ -1237,6 +1454,581 @@ class AccountService:
             "requestUrl": normalized_base_url,
             "databasePath": str(self.db_path),
         }
+
+    def ocr_image_text(self, image_path: str) -> dict[str, Any]:
+        resolved_image_path = self.resolve_image_file_path(image_path)
+        engine = self._get_paddle_ocr_engine()
+        lines = self._recognize_image_text_lines(engine, resolved_image_path)
+        text = "\n".join(
+            str(item.get("text") or "").strip()
+            for item in lines
+            if str(item.get("text") or "").strip()
+        ).strip()
+        logger.info(
+            "Image OCR completed image=%s line_count=%s text_length=%s",
+            resolved_image_path,
+            len(lines),
+            len(text),
+        )
+        return {
+            "engine": OCR_ENGINE_NAME,
+            "imagePath": str(resolved_image_path),
+            "lineCount": len(lines),
+            "text": text,
+            "lines": lines,
+            "databasePath": str(self.db_path),
+        }
+
+    def get_ocr_model_status_payload(self) -> dict[str, Any]:
+        cache_dir = self.resolve_paddle_cache_home()
+        dependency_items = self.collect_ocr_dependency_items()
+        dependencies_ready = all(item["importable"] for item in dependency_items)
+        cache_writable, cache_writable_message = self.check_directory_writable(cache_dir)
+        artifact_summary = self.collect_ocr_model_artifact_summary(cache_dir)
+        marker_payload = self.load_ocr_model_ready_marker()
+        engine_initialized = self._paddle_ocr_engine is not None
+        verified = bool(marker_payload)
+
+        status = "not_downloaded"
+        ready = False
+        message = "还没有检测到本地 OCR 模型，请点击下载模型。"
+
+        if not dependencies_ready:
+            status = "missing_dependencies"
+            message = "OCR 运行依赖未就绪，请先确认 `paddleocr`、`paddlepaddle` 和 `paddlex` 已正确安装。"
+        elif not cache_writable:
+            status = "cache_unwritable"
+            message = cache_writable_message or "OCR 模型缓存目录不可写。"
+        elif engine_initialized:
+            status = "ready"
+            ready = True
+            message = "OCR 引擎已在当前进程初始化完成，可以直接使用。"
+        elif verified and artifact_summary["artifactFileCount"] > 0:
+            status = "ready"
+            ready = True
+            message = "已检测到本地 OCR 模型，并且存在成功校验记录。"
+        elif artifact_summary["artifactFileCount"] > 0:
+            status = "cached_unverified"
+            message = "已检测到本地模型文件，但还没有成功校验记录，建议点击下载模型补齐并校验。"
+
+        return {
+            "engine": OCR_ENGINE_NAME,
+            "status": status,
+            "ready": ready,
+            "message": message,
+            "dependenciesReady": dependencies_ready,
+            "dependencyItems": dependency_items,
+            "cacheDir": str(cache_dir),
+            "cacheExists": cache_dir.exists(),
+            "cacheWritable": cache_writable,
+            "cacheWritableMessage": cache_writable_message,
+            "artifactFileCount": artifact_summary["artifactFileCount"],
+            "artifactDirectoryCount": artifact_summary["artifactDirectoryCount"],
+            "cacheSizeBytes": artifact_summary["cacheSizeBytes"],
+            "sampleFiles": artifact_summary["sampleFiles"],
+            "engineInitialized": engine_initialized,
+            "verified": verified,
+            "verifiedAt": marker_payload.get("verifiedAt", "") if marker_payload else "",
+            "databasePath": str(self.db_path),
+        }
+
+    def download_ocr_models(self) -> dict[str, Any]:
+        if not self._paddle_ocr_download_lock.acquire(blocking=False):
+            raise RuntimeError("OCR 模型正在下载或校验中，请稍后再试。")
+
+        try:
+            status_payload = self.get_ocr_model_status_payload()
+            if not status_payload["dependenciesReady"]:
+                raise RuntimeError(status_payload["message"])
+            if not status_payload["cacheWritable"]:
+                raise RuntimeError(status_payload["message"])
+            if status_payload["ready"]:
+                status_payload["downloaded"] = False
+                status_payload["message"] = "OCR 模型已就绪，无需重复下载。"
+                return status_payload
+
+            self._get_paddle_ocr_engine()
+            refreshed = self.get_ocr_model_status_payload()
+            refreshed["downloaded"] = True
+            if not refreshed["ready"]:
+                raise RuntimeError(refreshed["message"] or "OCR 模型下载后校验失败。")
+            refreshed["message"] = "OCR 模型已下载并完成校验。"
+            return refreshed
+        finally:
+            self._paddle_ocr_download_lock.release()
+
+    def collect_ocr_dependency_items(self) -> list[dict[str, Any]]:
+        self.configure_paddle_runtime_env()
+        items: list[dict[str, Any]] = []
+        for module_name, package_name in (
+            ("paddleocr", "paddleocr"),
+            ("paddle", "paddlepaddle"),
+            ("paddlex", "paddlex"),
+        ):
+            installed = self.is_python_module_installed(module_name)
+            importable = False
+            error_message = ""
+            if installed:
+                try:
+                    importlib.import_module(module_name)
+                    importable = True
+                except Exception as exc:
+                    error_message = str(exc).strip() or exc.__class__.__name__
+
+            items.append(
+                {
+                    "module": module_name,
+                    "package": package_name,
+                    "installed": installed,
+                    "importable": importable,
+                    "errorMessage": error_message,
+                }
+            )
+        return items
+
+    def is_python_module_installed(self, module_name: str) -> bool:
+        try:
+            return importlib.util.find_spec(module_name) is not None
+        except Exception:
+            return False
+
+    def configure_paddle_runtime_env(self) -> Path:
+        cache_dir = self.resolve_paddle_cache_home()
+        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_dir))
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        return cache_dir
+
+    def check_directory_writable(self, directory: Path) -> tuple[bool, str]:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            probe_path = directory / ".write-probe"
+            probe_path.write_text("ok", encoding="utf-8")
+            probe_path.unlink(missing_ok=True)
+            return True, "缓存目录可写"
+        except Exception as exc:
+            return False, f"缓存目录不可写: {exc}"
+
+    def collect_ocr_model_artifact_summary(self, cache_dir: Path) -> dict[str, Any]:
+        artifact_files: list[Path] = []
+        artifact_directories: set[str] = set()
+        cache_size_bytes = 0
+        if cache_dir.exists():
+            for candidate in cache_dir.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                try:
+                    cache_size_bytes += candidate.stat().st_size
+                except OSError:
+                    pass
+                if not self.is_ocr_model_signature_file(candidate):
+                    continue
+                artifact_files.append(candidate)
+                try:
+                    relative_parent = candidate.parent.relative_to(cache_dir)
+                    artifact_directories.add(str(relative_parent))
+                except ValueError:
+                    artifact_directories.add(str(candidate.parent))
+
+        sample_files: list[str] = []
+        for path in artifact_files[:6]:
+            try:
+                sample_files.append(str(path.relative_to(cache_dir)))
+            except ValueError:
+                sample_files.append(str(path))
+
+        return {
+            "artifactFileCount": len(artifact_files),
+            "artifactDirectoryCount": len(artifact_directories),
+            "cacheSizeBytes": cache_size_bytes,
+            "sampleFiles": sample_files,
+        }
+
+    def is_ocr_model_signature_file(self, path: Path) -> bool:
+        suffix = path.suffix.lower()
+        if suffix in OCR_MODEL_SIGNATURE_SUFFIXES:
+            return True
+        return path.name.lower() in OCR_MODEL_SIGNATURE_FILENAMES
+
+    def resolve_ocr_model_ready_marker_path(self) -> Path:
+        return self.resolve_paddle_cache_home() / OCR_MODEL_READY_MARKER_FILENAME
+
+    def load_ocr_model_ready_marker(self) -> dict[str, Any] | None:
+        marker_path = self.resolve_ocr_model_ready_marker_path()
+        if not marker_path.exists() or not marker_path.is_file():
+            return None
+        try:
+            payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def persist_ocr_model_ready_marker(self) -> dict[str, Any]:
+        cache_dir = self.resolve_paddle_cache_home()
+        artifact_summary = self.collect_ocr_model_artifact_summary(cache_dir)
+        payload = {
+            "engine": OCR_ENGINE_NAME,
+            "verifiedAt": now_local().isoformat(sep=" ", timespec="seconds"),
+            "cacheDir": str(cache_dir),
+            "artifactFileCount": artifact_summary["artifactFileCount"],
+            "artifactDirectoryCount": artifact_summary["artifactDirectoryCount"],
+            "cacheSizeBytes": artifact_summary["cacheSizeBytes"],
+        }
+        marker_path = self.resolve_ocr_model_ready_marker_path()
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return payload
+
+    def _get_paddle_ocr_engine(self) -> Any:
+        if self._paddle_ocr_engine is not None:
+            return self._paddle_ocr_engine
+
+        with self._paddle_ocr_lock:
+            if self._paddle_ocr_engine is not None:
+                return self._paddle_ocr_engine
+            self._paddle_ocr_engine = self._create_paddle_ocr_engine()
+            self.persist_ocr_model_ready_marker()
+            return self._paddle_ocr_engine
+
+    def _create_paddle_ocr_engine(self) -> Any:
+        self.configure_paddle_runtime_env()
+        try:
+            from paddleocr import PaddleOCR
+        except Exception as exc:
+            raise RuntimeError(
+                "未安装 PaddleOCR 运行依赖，请先安装 `paddleocr`，并按官方文档安装 PaddlePaddle。"
+            ) from exc
+
+        init_attempts = self._build_paddle_ocr_init_attempts(PaddleOCR)
+        last_error: Exception | None = None
+        for kwargs in init_attempts:
+            try:
+                return PaddleOCR(**kwargs)
+            except Exception as exc:
+                if not self._is_retryable_paddle_ocr_init_error(exc):
+                    raise RuntimeError(self._format_paddle_ocr_init_error(exc)) from exc
+                last_error = exc
+                continue
+
+        raise RuntimeError(self._format_paddle_ocr_init_error(last_error))
+
+    def _build_paddle_ocr_init_attempts(
+        self,
+        paddle_ocr_class: Any,
+    ) -> tuple[dict[str, Any], ...]:
+        supported_params = self._get_paddle_ocr_supported_params(paddle_ocr_class)
+        attempts: list[dict[str, Any]] = []
+
+        def add_attempt(**kwargs: Any) -> None:
+            attempt = kwargs
+            if supported_params is not None:
+                attempt = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key in supported_params
+                }
+            if attempt not in attempts:
+                attempts.append(attempt)
+
+        # PaddleOCR 3.x 默认会拉起文档预处理与方向分类模型；调试台只需要纯 OCR。
+        add_attempt(
+            lang="ch",
+            show_log=False,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            use_angle_cls=False,
+        )
+        add_attempt(
+            lang="ch",
+            show_log=False,
+            use_angle_cls=False,
+        )
+        add_attempt(lang="ch", show_log=False)
+        add_attempt(lang="ch")
+        add_attempt()
+        return tuple(attempts)
+
+    def _get_paddle_ocr_supported_params(
+        self,
+        paddle_ocr_class: Any,
+    ) -> set[str] | None:
+        try:
+            signature = inspect.signature(paddle_ocr_class)
+        except (TypeError, ValueError):
+            return None
+
+        return {
+            name
+            for name, parameter in signature.parameters.items()
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+
+    def _is_retryable_paddle_ocr_init_error(self, error: Exception) -> bool:
+        if isinstance(error, TypeError):
+            return True
+
+        message = str(error or "").strip().lower()
+        if not message:
+            return False
+
+        retryable_fragments = (
+            "unknown argument",
+            "unexpected keyword argument",
+            "got an unexpected keyword argument",
+            "invalid keyword argument",
+        )
+        return any(fragment in message for fragment in retryable_fragments)
+
+    def _format_paddle_ocr_init_error(self, error: Exception | None) -> str:
+        if error is None:
+            return "PaddleOCR 初始化失败: 不支持当前初始化参数"
+
+        message = str(error).strip() or error.__class__.__name__
+        if self._looks_like_paddle_model_download_error(message):
+            return (
+                "PaddleOCR 初始化失败: 首次运行需要下载 OCR 模型，请确认当前网络可访问 "
+                "HuggingFace/AiStudio，或提前把模型缓存到 "
+                f"{self.resolve_paddle_cache_home()}。原始错误: {message}"
+            )
+        return f"PaddleOCR 初始化失败: {message}"
+
+    def _looks_like_paddle_model_download_error(self, message: str) -> bool:
+        normalized = str(message or "").strip().lower()
+        if not normalized:
+            return False
+
+        fragments = (
+            "huggingface",
+            "aistudio",
+            "model hoster",
+            "download model",
+            "failed to download",
+            "timed out",
+            "timeout",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "connection reset",
+            "connection refused",
+            "proxyerror",
+            "ssl",
+        )
+        return any(fragment in normalized for fragment in fragments)
+
+    def ocr_remote_image_text(self, image_url: str) -> dict[str, Any]:
+        normalized_image_url = self.normalize_remote_image_url(image_url)
+        with tempfile.TemporaryDirectory(prefix="huasheng-cover-ocr-") as temp_dir:
+            target_path = Path(temp_dir) / (
+                f"cover{self.resolve_remote_image_suffix(normalized_image_url)}"
+            )
+            self._download_image_to_path(normalized_image_url, target_path)
+            payload = self.ocr_image_text(str(target_path))
+
+        payload["imageUrl"] = normalized_image_url
+        return payload
+
+    def normalize_remote_image_url(self, value: Any) -> str:
+        normalized = self.normalize_text_field(
+            value,
+            field_name="封面图片地址",
+            max_length=4000,
+        )
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("封面图片地址无效，必须是 http/https 链接。")
+        return normalized
+
+    def resolve_remote_image_suffix(self, image_url: str) -> str:
+        suffix = Path(urlparse(str(image_url or "")).path).suffix.lower()
+        if suffix in SUPPORTED_IMAGE_SUFFIXES:
+            return suffix
+        return ".png"
+
+    def _download_image_to_path(self, image_url: str, target_path: Path) -> None:
+        request = Request(
+            image_url,
+            headers={
+                "Accept": "image/*,*/*;q=0.8",
+                "User-Agent": MODEL_REQUEST_USER_AGENT,
+            },
+            method="GET",
+        )
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with urlopen(request, timeout=COVER_IMAGE_DOWNLOAD_TIMEOUT) as response:
+            with target_path.open("wb") as output_file:
+                while True:
+                    chunk = response.read(VIDEO_DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    output_file.write(chunk)
+
+        if not target_path.exists() or target_path.stat().st_size <= 0:
+            raise RuntimeError("封面图片下载失败: 响应内容为空。")
+
+    def _recognize_image_text_lines(self, engine: Any, image_path: Path) -> list[dict[str, Any]]:
+        normalized_path = str(image_path)
+        if hasattr(engine, "predict"):
+            try:
+                return self._extract_ocr_lines_from_predict_results(
+                    engine.predict(normalized_path)
+                )
+            except TypeError:
+                try:
+                    return self._extract_ocr_lines_from_predict_results(
+                        engine.predict(input=normalized_path)
+                    )
+                except TypeError:
+                    pass
+                except Exception as exc:
+                    raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
+            except Exception as exc:
+                raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
+
+        if hasattr(engine, "ocr"):
+            try:
+                return self._extract_ocr_lines_from_legacy_results(
+                    engine.ocr(normalized_path, cls=True)
+                )
+            except TypeError:
+                try:
+                    return self._extract_ocr_lines_from_legacy_results(engine.ocr(normalized_path))
+                except Exception as exc:
+                    raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
+            except Exception as exc:
+                raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
+
+        raise RuntimeError("当前 PaddleOCR 版本没有可用的图片识别入口。")
+
+    def _extract_ocr_lines_from_predict_results(
+        self,
+        results: Any,
+    ) -> list[dict[str, Any]]:
+        normalized_lines: list[dict[str, Any]] = []
+        for item in list(results or []):
+            payload = self._normalize_paddle_predict_payload(item)
+            result_payload = payload.get("res") if isinstance(payload.get("res"), dict) else payload
+            texts = result_payload.get("rec_texts") or result_payload.get("texts") or []
+            scores = result_payload.get("rec_scores") or result_payload.get("scores") or []
+            boxes = (
+                result_payload.get("rec_boxes")
+                or result_payload.get("dt_polys")
+                or result_payload.get("rec_polys")
+                or result_payload.get("boxes")
+                or []
+            )
+            if isinstance(texts, str):
+                texts = [texts]
+
+            for index, text in enumerate(texts):
+                normalized_text = str(text or "").strip()
+                if not normalized_text:
+                    continue
+                normalized_lines.append(
+                    self._build_ocr_line_payload(
+                        text=normalized_text,
+                        score=scores[index] if index < len(scores) else None,
+                        box=boxes[index] if index < len(boxes) else None,
+                    )
+                )
+        return normalized_lines
+
+    def _extract_ocr_lines_from_legacy_results(
+        self,
+        results: Any,
+    ) -> list[dict[str, Any]]:
+        normalized_lines: list[dict[str, Any]] = []
+        for page in list(results or []):
+            for item in list(page or []):
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                box = item[0]
+                raw_recognition = item[1]
+                text = ""
+                score: Any = None
+                if isinstance(raw_recognition, dict):
+                    text = str(
+                        raw_recognition.get("text")
+                        or raw_recognition.get("rec_text")
+                        or ""
+                    ).strip()
+                    score = raw_recognition.get("score") or raw_recognition.get("rec_score")
+                elif isinstance(raw_recognition, (list, tuple)):
+                    text = str(raw_recognition[0] if raw_recognition else "").strip()
+                    score = raw_recognition[1] if len(raw_recognition) > 1 else None
+                else:
+                    text = str(raw_recognition or "").strip()
+
+                if not text:
+                    continue
+                normalized_lines.append(
+                    self._build_ocr_line_payload(
+                        text=text,
+                        score=score,
+                        box=box,
+                    )
+                )
+        return normalized_lines
+
+    def _normalize_paddle_predict_payload(self, item: Any) -> dict[str, Any]:
+        payload = item
+        if hasattr(payload, "json"):
+            payload = getattr(payload, "json")
+
+        if callable(payload):
+            payload = payload()
+        elif hasattr(payload, "model_dump"):
+            payload = payload.model_dump()
+        elif hasattr(payload, "dict"):
+            payload = payload.dict()
+
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return {}
+
+        return payload if isinstance(payload, dict) else {}
+
+    def _build_ocr_line_payload(
+        self,
+        *,
+        text: str,
+        score: Any = None,
+        box: Any = None,
+    ) -> dict[str, Any]:
+        normalized_score: float | None = None
+        if score not in (None, ""):
+            try:
+                normalized_score = round(float(score), 4)
+            except (TypeError, ValueError):
+                normalized_score = None
+        return {
+            "text": str(text or "").strip(),
+            "score": normalized_score,
+            "box": self._normalize_ocr_box(box),
+        }
+
+    def _normalize_ocr_box(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, tuple):
+            value = list(value)
+        if isinstance(value, list):
+            return [self._normalize_ocr_box(item) for item in value]
+        if isinstance(value, (int, float, str, bool)):
+            return value
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
 
     def start_task_processor(self) -> None:
         with self._task_processor_state_lock:
@@ -1395,6 +2187,7 @@ class AccountService:
             query = (
                 TaskRecord.select(TaskRecord.id)
                 .where(
+                    TaskRecord.status == TASK_STATUS_PENDING,
                     TaskRecord.article_id.is_null(False),
                     TaskRecord.rewritten_content == "",
                 )
@@ -1407,6 +2200,7 @@ class AccountService:
             query = (
                 TaskRecord.select(TaskRecord.id)
                 .where(
+                    TaskRecord.status == TASK_STATUS_REWRITE_READY,
                     TaskRecord.article_id.is_null(False),
                     TaskRecord.rewritten_content != "",
                     TaskRecord.title == "",
@@ -1420,6 +2214,7 @@ class AccountService:
             query = (
                 TaskRecord.select(TaskRecord.id)
                 .where(
+                    TaskRecord.status == TASK_STATUS_READY_FOR_HUASHENG,
                     TaskRecord.article_id.is_null(False),
                     TaskRecord.rewritten_content != "",
                     TaskRecord.title != "",
@@ -1577,6 +2372,14 @@ class AccountService:
                 raise ValueError("文章内容为空，无法执行改写。")
             return content
 
+    def load_task_source_article_text(self, task: TaskRecord) -> str:
+        snapshot_content = str(task.article_content or "").strip()
+        if snapshot_content:
+            return snapshot_content
+        if not task.article_id:
+            raise ValueError("任务没有文章 ID，无法读取原文。")
+        return self.load_source_article_text(int(task.article_id))
+
     def load_model_settings_snapshot(self) -> dict[str, str]:
         payload = self.get_model_settings_payload()
         settings = payload.get("settings") or {}
@@ -1728,6 +2531,102 @@ class AccountService:
     def is_project_failed(self, payload: dict[str, Any] | None) -> bool:
         return bool(re.search(r"失败|异常|取消", self.build_project_state_text(payload)))
 
+    def is_project_website_link_check_enabled(self) -> bool:
+        settings = self.get_global_settings_payload()["settings"]
+        return bool(settings.get("checkWebsiteLinks"))
+
+    def find_project_cover_website_link_violation(
+        self,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        seen_urls: set[str] = set()
+        for cover_item in self.iter_project_clip_cover_urls(payload):
+            cover_url = cover_item["coverUrl"]
+            if cover_url in seen_urls:
+                continue
+            seen_urls.add(cover_url)
+            ocr_payload = self.ocr_remote_image_text(cover_url)
+            matched_link = self.extract_website_link_from_text(ocr_payload.get("text") or "")
+            if not matched_link:
+                continue
+            return {
+                "clipIndex": cover_item["clipIndex"],
+                "coverUrl": cover_url,
+                "matchedLink": matched_link,
+                "ocrText": str(ocr_payload.get("text") or ""),
+            }
+        return None
+
+    def iter_project_clip_cover_urls(
+        self,
+        payload: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        source = payload if isinstance(payload, dict) else {}
+        clips = source.get("clips")
+        if not isinstance(clips, list):
+            return []
+
+        items: list[dict[str, Any]] = []
+        for index, clip in enumerate(clips, start=1):
+            if not isinstance(clip, dict):
+                continue
+            clip_seen_urls: set[str] = set()
+            for candidate in (
+                clip.get("cover"),
+                self._extract_nested_cover_url(clip.get("video")),
+                self._extract_nested_cover_url(clip.get("composite_video")),
+                self._extract_nested_cover_url(clip.get("ppt_video")),
+            ):
+                normalized = str(candidate or "").strip()
+                if not normalized or normalized in clip_seen_urls:
+                    continue
+                clip_seen_urls.add(normalized)
+                items.append(
+                    {
+                        "clipIndex": index,
+                        "coverUrl": normalized,
+                    }
+                )
+            for candidate in list(clip.get("video_candidates") or []):
+                normalized = self._extract_nested_cover_url(candidate)
+                if not normalized or normalized in clip_seen_urls:
+                    continue
+                clip_seen_urls.add(normalized)
+                items.append(
+                    {
+                        "clipIndex": index,
+                        "coverUrl": normalized,
+                    }
+                )
+        return items
+
+    def _extract_nested_cover_url(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("cover") or "").strip()
+
+    def extract_website_link_from_text(self, text: Any) -> str:
+        normalized = self.normalize_ocr_text_for_website_link_detection(text)
+        if not normalized:
+            return ""
+
+        candidates = [normalized]
+        compact = re.sub(r"\s+", "", normalized)
+        if compact and compact not in candidates:
+            candidates.append(compact)
+
+        for candidate in candidates:
+            match = WEBSITE_LINK_PATTERN.search(candidate)
+            if match:
+                return str(match.group(0) or "").strip().rstrip(".,;:!?)]}>")
+        return ""
+
+    def normalize_ocr_text_for_website_link_detection(self, text: Any) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+        return normalized.translate(WEBSITE_LINK_TEXT_TRANSLATION)
+
     def parse_export_progress(self, payload: dict[str, Any] | None) -> int:
         source = payload if isinstance(payload, dict) else {}
         return self.normalize_task_progress(source.get("progress"))
@@ -1865,10 +2764,24 @@ class AccountService:
         account: Account,
         *,
         today_generation_count: int | None = None,
+        active_huasheng_task_count: int | None = None,
+        max_concurrent_tasks_per_account: int | None = None,
     ) -> dict[str, Any]:
         if today_generation_count is None:
             today_generation_count = self.count_huasheng_generation_records_for_account_today(
                 account.id
+            )
+        if active_huasheng_task_count is None:
+            active_huasheng_task_count = self.list_huasheng_active_task_counts().get(
+                int(account.id),
+                0,
+            )
+        if max_concurrent_tasks_per_account is None:
+            max_concurrent_tasks_per_account = int(
+                self.load_huasheng_voice_settings_snapshot().get(
+                    "maxConcurrentTasksPerAccount"
+                )
+                or 1
             )
         return {
             "id": account.id,
@@ -1878,6 +2791,8 @@ class AccountService:
             "isDisabled": account.is_disabled,
             "todayGenerationCount": int(today_generation_count or 0),
             "dailyGenerationLimit": HUASHENG_DAILY_PROJECT_LIMIT,
+            "activeHuashengTaskCount": int(active_huasheng_task_count or 0),
+            "maxConcurrentTasksPerAccount": int(max_concurrent_tasks_per_account or 1),
             "createdAt": account.created_at.isoformat(sep=" ", timespec="seconds"),
             "updatedAt": account.updated_at.isoformat(sep=" ", timespec="seconds"),
         }
@@ -1895,7 +2810,7 @@ class AccountService:
             "accountNote": task.account_note,
             "projectPid": task.project_pid,
             "articleId": task.article_id,
-            "articlePreview": article_preview,
+            "articlePreview": article_preview or str(task.article_content or "").strip(),
             "rewrittenContent": task.rewritten_content,
             "title": task.title,
             "rewritePromptId": task.rewrite_prompt_id,
@@ -1958,6 +2873,25 @@ class AccountService:
         normalized_account_id = self.normalize_positive_int(account_id, field_name="account_id")
         return self.list_huasheng_generation_counts_for_day().get(normalized_account_id, 0)
 
+    def list_huasheng_active_task_counts(self) -> dict[int, int]:
+        active_statuses = (
+            TASK_STATUS_HUASHENG_POLLING,
+            TASK_STATUS_SUBTITLE_APPLYING,
+            TASK_STATUS_EXPORT_RUNNING,
+        )
+        counts: dict[int, int] = {}
+        with database.connection_context():
+            query = TaskRecord.select(TaskRecord.account_id).where(
+                TaskRecord.status.in_(active_statuses),
+                TaskRecord.video_url == "",
+            )
+            for task in query:
+                account_id = int(task.account_id or 0)
+                if account_id <= 0:
+                    continue
+                counts[account_id] = counts.get(account_id, 0) + 1
+        return counts
+
     def build_huasheng_generation_count_map(
         self,
         account_ids: list[int] | tuple[int, ...] | set[int],
@@ -2010,27 +2944,127 @@ class AccountService:
             "databasePath": str(self.db_path),
         }
 
-    def list_huasheng_generation_candidate_accounts(self) -> list[tuple[Account, int]]:
+    def extract_huasheng_response_code(self, payload: dict[str, Any] | None) -> int | None:
+        if not isinstance(payload, dict):
+            return None
+        raw_code = payload.get("code")
+        if raw_code in (None, ""):
+            return None
+        try:
+            return int(raw_code)
+        except (TypeError, ValueError):
+            return None
+
+    def build_huasheng_response_text(self, payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        project = self.extract_project_payload(payload)
+        parts: list[str] = []
+        for field in ("reason", "message", "status", "loading_msg", "state_message"):
+            for source in (payload, project):
+                value = str(source.get(field) or "").strip()
+                if value and value not in parts:
+                    parts.append(value)
+        return " ".join(parts).strip()
+
+    def is_huasheng_daily_limit_reached_payload(
+        self,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if self.extract_huasheng_response_code(payload) == HUASHENG_DAILY_LIMIT_REACHED_CODE:
+            return True
+        response_text = self.build_huasheng_response_text(payload)
+        return bool(re.search(r"超量|上限|限额", response_text))
+
+    def build_huasheng_create_error_detail(self, payload: dict[str, Any] | None) -> str:
+        response_text = self.build_huasheng_response_text(payload)
+        response_code = self.extract_huasheng_response_code(payload)
+        if response_code is not None and response_text:
+            return f"code={response_code} {response_text}"
+        if response_code is not None:
+            return f"code={response_code}"
+        if response_text:
+            return response_text
+        if isinstance(payload, dict) and payload:
+            return f"返回结构异常: {json.dumps(payload, ensure_ascii=False)[:200]}"
+        return "接口返回了无效结果"
+
+    def build_huasheng_generation_placeholder_project_pid(
+        self,
+        account_id: int,
+        slot_index: int,
+        *,
+        reference_time: datetime | None = None,
+    ) -> str:
+        normalized_account_id = self.normalize_positive_int(account_id, field_name="account_id")
+        normalized_slot_index = self.normalize_positive_int(slot_index, field_name="slot_index")
+        timestamp = reference_time or now_local()
+        return (
+            f"{HUASHENG_GENERATION_PLACEHOLDER_PREFIX}-"
+            f"{timestamp.strftime('%Y%m%d')}-"
+            f"{normalized_account_id}-"
+            f"{normalized_slot_index}"
+        )
+
+    def fill_huasheng_generation_placeholders_to_limit(
+        self,
+        account_id: int,
+        *,
+        current_count: int | None = None,
+        reference_time: datetime | None = None,
+    ) -> int:
+        normalized_account_id = self.normalize_positive_int(account_id, field_name="account_id")
+        if current_count is None:
+            existing_count = self.count_huasheng_generation_records_for_account_today(
+                normalized_account_id
+            )
+        else:
+            existing_count = max(0, int(current_count))
+        if existing_count >= HUASHENG_DAILY_PROJECT_LIMIT:
+            return 0
+
+        timestamp = reference_time or now_local()
+        created_count = 0
+        for slot_index in range(existing_count + 1, HUASHENG_DAILY_PROJECT_LIMIT + 1):
+            placeholder_pid = self.build_huasheng_generation_placeholder_project_pid(
+                normalized_account_id,
+                slot_index,
+                reference_time=timestamp,
+            )
+            self.create_huasheng_generation_record(
+                normalized_account_id,
+                placeholder_pid,
+                generated_at=timestamp,
+            )
+            created_count += 1
+        return created_count
+
+    def list_huasheng_generation_candidate_accounts(self) -> list[tuple[Account, int, int]]:
         with database.connection_context():
             accounts = list(
                 Account.select()
                 .where(Account.is_disabled == False)
-                .order_by(Account.updated_at.desc(), Account.id.desc())
+                .order_by(Account.id.asc())
             )
         if not accounts:
             raise ValueError("请先至少启用一个花生账号。")
 
         generation_counts = self.list_huasheng_generation_counts_for_day()
+        active_task_counts = self.list_huasheng_active_task_counts()
         ranked_accounts = sorted(
             accounts,
             key=lambda account: (
+                active_task_counts.get(int(account.id), 0),
                 generation_counts.get(int(account.id), 0),
-                -account.updated_at.timestamp(),
-                -int(account.id),
+                int(account.id),
             ),
         )
         return [
-            (account, generation_counts.get(int(account.id), 0))
+            (
+                account,
+                generation_counts.get(int(account.id), 0),
+                active_task_counts.get(int(account.id), 0),
+            )
             for account in ranked_accounts
         ]
 
@@ -2054,11 +3088,17 @@ class AccountService:
         )
         normalized_voice_id = self.normalize_positive_int(voice_id, field_name="voice_id")
         normalized_speech_rate = self.normalize_speech_rate(speech_rate)
+        max_concurrent_tasks = int(
+            self.load_huasheng_voice_settings_snapshot().get("maxConcurrentTasksPerAccount") or 1
+        )
 
         with self._huasheng_account_selection_lock:
             candidate_accounts = self.list_huasheng_generation_candidate_accounts()
             errors: list[str] = []
-            for account, used_count in candidate_accounts:
+            limit_reached_count = 0
+            concurrency_reached_count = 0
+            skipped_by_capacity_count = 0
+            for account, used_count, active_task_count in candidate_accounts:
                 if used_count >= HUASHENG_DAILY_PROJECT_LIMIT:
                     logger.debug(
                         "Huasheng account skipped because daily limit reached account_id=%s used=%s limit=%s",
@@ -2069,6 +3109,18 @@ class AccountService:
                     errors.append(
                         f"{account.phone} 今日已生成 {used_count}/{HUASHENG_DAILY_PROJECT_LIMIT} 条"
                     )
+                    skipped_by_capacity_count += 1
+                    continue
+
+                if active_task_count >= max_concurrent_tasks:
+                    logger.debug(
+                        "Huasheng account skipped because concurrent task limit reached account_id=%s active=%s limit=%s",
+                        account.id,
+                        active_task_count,
+                        max_concurrent_tasks,
+                    )
+                    concurrency_reached_count += 1
+                    skipped_by_capacity_count += 1
                     continue
 
                 account_snapshot = self.build_account_snapshot(account)
@@ -2118,7 +3170,36 @@ class AccountService:
                     errors.append(f"{account.phone} 创建失败: {exc}")
                     continue
 
-                project_identifier = self.resolve_created_project_identifier(payload)
+                if self.is_huasheng_daily_limit_reached_payload(payload):
+                    placeholders_added = self.fill_huasheng_generation_placeholders_to_limit(
+                        int(account.id),
+                        current_count=used_count,
+                    )
+                    logger.warning(
+                        "Huasheng account quota reached during create-project account_id=%s phone=%s used_before=%s placeholders_added=%s",
+                        account.id,
+                        account.phone,
+                        used_count,
+                        placeholders_added,
+                    )
+                    errors.append(
+                        f"{account.phone} 今日已生成 {HUASHENG_DAILY_PROJECT_LIMIT}/{HUASHENG_DAILY_PROJECT_LIMIT} 条"
+                    )
+                    limit_reached_count += 1
+                    continue
+
+                try:
+                    project_identifier = self.resolve_created_project_identifier(payload)
+                except ValueError:
+                    error_detail = self.build_huasheng_create_error_detail(payload)
+                    logger.warning(
+                        "Huasheng account create-project returned invalid payload account_id=%s phone=%s detail=%s",
+                        account.id,
+                        account.phone,
+                        error_detail,
+                    )
+                    errors.append(f"{account.phone} 创建失败: {error_detail}")
+                    continue
                 self.create_huasheng_generation_record(
                     int(account.id),
                     project_identifier,
@@ -2130,6 +3211,14 @@ class AccountService:
                 )
                 return account_snapshot, payload, project_identifier
 
+        if candidate_accounts and skipped_by_capacity_count == len(candidate_accounts):
+            if concurrency_reached_count:
+                raise HuashengCreateRetryRequired(
+                    TASK_HUASHENG_STATUS_WAIT_FOR_AVAILABLE_ACCOUNT
+                )
+            if limit_reached_count:
+                raise HuashengCreateRetryRequired(TASK_HUASHENG_STATUS_ACCOUNT_RETRY)
+
         error_message = "；".join(errors[:5]).strip()
         if error_message:
             raise RuntimeError(f"没有可用的花生账号: {error_message}")
@@ -2139,13 +3228,23 @@ class AccountService:
         self,
         tasks: list[TaskRecord],
     ) -> dict[int, str]:
-        article_ids = sorted({int(task.article_id) for task in tasks if task.article_id})
+        preview_map: dict[int, str] = {
+            int(task.article_id): str(task.article_content or "").strip()
+            for task in tasks
+            if task.article_id and str(task.article_content or "").strip()
+        }
+        article_ids = sorted(
+            {
+                int(task.article_id)
+                for task in tasks
+                if task.article_id and int(task.article_id) not in preview_map
+            }
+        )
         if not article_ids:
-            return {}
+            return preview_map
         if not database.table_exists(MonitoredArticle._meta.table_name):
-            return {}
+            return preview_map
 
-        preview_map: dict[int, str] = {}
         query = MonitoredArticle.select(
             MonitoredArticle.id,
             MonitoredArticle.content,
@@ -2154,6 +3253,29 @@ class AccountService:
         for article in query:
             preview_map[article.id] = str(article.content or article.title or "").strip()
         return preview_map
+
+    def delete_monitored_articles_by_ids(
+        self,
+        article_ids: list[int] | tuple[int, ...],
+        *,
+        timestamp: datetime | None = None,
+    ) -> int:
+        del timestamp
+        normalized_article_ids = self.normalize_positive_int_list(
+            article_ids,
+            field_name="article_ids",
+        )
+        if not normalized_article_ids:
+            return 0
+        if not database.table_exists(MonitoredArticle._meta.table_name):
+            return 0
+        delete_query = MonitoredArticle.delete().where(
+            MonitoredArticle.id.in_(normalized_article_ids)
+        )
+        if database.is_closed():
+            with database.connection_context():
+                return int(delete_query.execute() or 0)
+        return int(delete_query.execute() or 0)
 
     def _ensure_task_record_schema(self) -> None:
         table_name = TaskRecord._meta.table_name
@@ -2173,6 +3295,7 @@ class AccountService:
             "account_note": '"account_note" TEXT NOT NULL DEFAULT \'\'',
             "account_cookies": '"account_cookies" TEXT NOT NULL DEFAULT \'\'',
             "article_id": '"article_id" INTEGER',
+            "article_content": '"article_content" TEXT NOT NULL DEFAULT \'\'',
             "rewritten_content": '"rewritten_content" TEXT NOT NULL DEFAULT \'\'',
             "title": '"title" TEXT NOT NULL DEFAULT \'\'',
             "rewrite_prompt_id": '"rewrite_prompt_id" INTEGER',
@@ -2210,6 +3333,7 @@ class AccountService:
               "account_cookies" TEXT NOT NULL DEFAULT '',
               "project_pid" VARCHAR(64) NOT NULL DEFAULT '',
               "article_id" INTEGER,
+              "article_content" TEXT NOT NULL DEFAULT '',
               "rewritten_content" TEXT NOT NULL DEFAULT '',
               "title" TEXT NOT NULL DEFAULT '',
               "rewrite_prompt_id" INTEGER,
@@ -2235,6 +3359,7 @@ class AccountService:
               "account_cookies",
               "project_pid",
               "article_id",
+              "article_content",
               "rewritten_content",
               "title",
               "rewrite_prompt_id",
@@ -2259,6 +3384,7 @@ class AccountService:
                 ELSE TRIM("project_pid")
               END,
               "article_id",
+              '',
               COALESCE("rewritten_content", ''),
               COALESCE("title", ''),
               "rewrite_prompt_id",
@@ -2437,6 +3563,10 @@ class AccountService:
             "downloadDir": self.normalize_download_directory(
                 settings.get("downloadDir")
             ),
+            "checkWebsiteLinks": self.normalize_boolean_flag(
+                settings.get("checkWebsiteLinks"),
+                default=bool(DEFAULT_GLOBAL_SETTINGS["checkWebsiteLinks"]),
+            ),
         }
 
     def normalize_thread_pool_size(self, value: Any) -> int:
@@ -2470,6 +3600,23 @@ class AccountService:
             raise ValueError("默认下载路径必须是文件夹。")
         return str(resolved_path)
 
+    def normalize_boolean_flag(self, value: Any, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+
+        normalized = str(value).strip().lower()
+        if not normalized:
+            return default
+        if normalized in {"1", "true", "yes", "y", "on", "是", "开", "开启"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "否", "关", "关闭"}:
+            return False
+        return default
+
     def normalize_huasheng_voice_settings(
         self,
         settings: dict[str, Any],
@@ -2502,7 +3649,22 @@ class AccountService:
                 max_length=4000,
             ),
             "speechRate": self.normalize_speech_rate(settings.get("speechRate")),
+            "maxConcurrentTasksPerAccount": self.normalize_huasheng_max_concurrent_tasks(
+                settings.get("maxConcurrentTasksPerAccount")
+            ),
         }
+
+    def normalize_huasheng_max_concurrent_tasks(self, value: Any) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = int(DEFAULT_HUASHENG_VOICE_SETTINGS["maxConcurrentTasksPerAccount"])
+
+        if normalized < HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MIN:
+            return HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MIN
+        if normalized > HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MAX:
+            return HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MAX
+        return normalized
 
     def normalize_text_field(
         self,
@@ -2582,6 +3744,30 @@ class AccountService:
         if not normalized:
             raise ValueError(f"{field_name} 不能为空。")
         return normalized
+
+    def resolve_image_file_path(self, image_path: str) -> Path:
+        normalized = self.normalize_required_text_field(
+            image_path,
+            field_name="图片路径",
+            max_length=4000,
+        )
+        path = Path(normalized).expanduser()
+        try:
+            resolved_path = path.resolve()
+        except OSError as exc:
+            raise ValueError(f"图片路径无效: {exc}") from exc
+
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise ValueError("图片文件不存在，请重新选择。")
+        if resolved_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+            allowed = "/".join(sorted(suffix.lstrip(".") for suffix in SUPPORTED_IMAGE_SUFFIXES))
+            raise ValueError(f"请选择支持的图片格式: {allowed}")
+        return resolved_path
+
+    def resolve_paddle_cache_home(self) -> Path:
+        cache_directory = self.db_path.parent / ".paddle-cache" / "paddlex"
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        return cache_directory.resolve()
 
     def resolve_download_directory_path(self) -> Path:
         settings = self.get_global_settings_payload()["settings"]
@@ -2822,8 +4008,34 @@ class AccountService:
     def _is_missing_task_error(self, error: Exception) -> bool:
         return isinstance(error, ValueError) and "任务不存在" in str(error)
 
+    def _run_stage_with_auto_retries(
+        self,
+        task_id: int,
+        *,
+        stage_label: str,
+        runner: Callable[[], None],
+    ) -> None:
+        total_attempts = TASK_STAGE_MAX_RETRIES + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                runner()
+                return
+            except HuashengCreateRetryRequired:
+                raise
+            except Exception as exc:
+                if self._is_missing_task_error(exc) or attempt >= total_attempts:
+                    raise
+                logger.warning(
+                    "Task %s retry scheduled task_id=%s attempt=%s/%s error=%s",
+                    stage_label,
+                    task_id,
+                    attempt,
+                    total_attempts,
+                    exc,
+                )
+
     def _run_rewrite_task(self, task_id: int) -> None:
-        try:
+        def run_once() -> None:
             task = self.find_task_record(task_id)
             if task is None:
                 logger.info("Task rewrite skipped because task was deleted task_id=%s", task_id)
@@ -2835,7 +4047,7 @@ class AccountService:
                 raise ValueError("任务没有改写提示词，无法执行改写。")
 
             model_settings = self.load_model_settings_snapshot()
-            article_text = self.load_source_article_text(int(task.article_id))
+            article_text = self.load_task_source_article_text(task)
             logger.info(
                 "Task rewrite started task_id=%s article_id=%s prompt_id=%s prompt_length=%s article_length=%s",
                 task_id,
@@ -2852,6 +4064,24 @@ class AccountService:
                 article_text,
                 prompt_id=task.rewrite_prompt_id,
             )
+            if payload.get("triggeredRedline"):
+                try:
+                    self.update_task_status(
+                        task_id,
+                        TASK_STATUS_REWRITE_REDLINE,
+                        rewritten_content=str(payload.get("content") or ""),
+                        huasheng_status=REWRITE_REDLINE_DISPLAY_TEXT,
+                    )
+                except Exception as status_error:
+                    if self._is_missing_task_error(status_error):
+                        logger.info(
+                            "Task rewrite redline result discarded because task was deleted task_id=%s",
+                            task_id,
+                        )
+                        return
+                    raise
+                logger.info("Task rewrite blocked by redline task_id=%s", task_id)
+                return
             try:
                 self.update_task_status(
                     task_id,
@@ -2872,6 +4102,13 @@ class AccountService:
                 len(str(payload.get("content") or "")),
                 TASK_STATUS_REWRITE_READY,
             )
+
+        try:
+            self._run_stage_with_auto_retries(
+                task_id,
+                stage_label="rewrite",
+                runner=run_once,
+            )
         except Exception as exc:
             if self._is_missing_task_error(exc):
                 logger.info("Task rewrite stopped because task was deleted task_id=%s", task_id)
@@ -2891,7 +4128,7 @@ class AccountService:
             raise RuntimeError(str(exc)) from exc
 
     def _run_title_task(self, task_id: int) -> None:
-        try:
+        def run_once() -> None:
             task = self.find_task_record(task_id)
             if task is None:
                 logger.info("Task title skipped because task was deleted task_id=%s", task_id)
@@ -2938,6 +4175,13 @@ class AccountService:
                 len(str(payload.get("title") or "")),
                 TASK_STATUS_READY_FOR_HUASHENG,
             )
+
+        try:
+            self._run_stage_with_auto_retries(
+                task_id,
+                stage_label="title",
+                runner=run_once,
+            )
         except Exception as exc:
             if self._is_missing_task_error(exc):
                 logger.info("Task title stopped because task was deleted task_id=%s", task_id)
@@ -2957,7 +4201,7 @@ class AccountService:
             raise RuntimeError(str(exc)) from exc
 
     def _run_huasheng_create_task(self, task_id: int) -> None:
-        try:
+        def run_once() -> None:
             task = self.find_task_record(task_id)
             if task is None:
                 logger.info("Task huasheng-create skipped because task was deleted task_id=%s", task_id)
@@ -3028,6 +4272,35 @@ class AccountService:
                 account_snapshot.get("usedTodayCount", 0),
                 account_snapshot.get("remainingTodayCount", HUASHENG_DAILY_PROJECT_LIMIT),
             )
+
+        try:
+            self._run_stage_with_auto_retries(
+                task_id,
+                stage_label="huasheng-create",
+                runner=run_once,
+            )
+        except HuashengCreateRetryRequired as exc:
+            logger.info(
+                "Task huasheng-create requeued task_id=%s reason=%s",
+                task_id,
+                exc,
+            )
+            try:
+                self.update_task_status(
+                    task_id,
+                    TASK_STATUS_READY_FOR_HUASHENG,
+                    huasheng_status=(
+                        str(exc)[:128] if str(exc).strip() else TASK_HUASHENG_STATUS_ACCOUNT_RETRY
+                    ),
+                )
+            except Exception as status_error:
+                if self._is_missing_task_error(status_error):
+                    logger.info(
+                        "Task huasheng-create requeue skipped because task was deleted task_id=%s",
+                        task_id,
+                    )
+                    return
+                raise
         except Exception as exc:
             if self._is_missing_task_error(exc):
                 logger.info("Task huasheng-create stopped because task was deleted task_id=%s", task_id)
@@ -3051,7 +4324,7 @@ class AccountService:
             raise RuntimeError(str(exc)) from exc
 
     def _run_huasheng_progress_task(self, task_id: int) -> None:
-        try:
+        def run_once() -> None:
             task = self.find_task_record(task_id)
             if task is None:
                 logger.info("Task huasheng-progress skipped because task was deleted task_id=%s", task_id)
@@ -3220,6 +4493,25 @@ class AccountService:
                 )
                 return
 
+            if self.is_project_website_link_check_enabled():
+                violation = self.find_project_cover_website_link_violation(project_payload)
+                if violation is not None:
+                    self.update_task_status(
+                        task_id,
+                        TASK_STATUS_EXPORT_FAILED,
+                        project_identifier,
+                        progress=100,
+                        huasheng_status=TASK_HUASHENG_STATUS_WEBSITE_LINK_BLOCKED,
+                    )
+                    logger.warning(
+                        "Task huasheng-project blocked by website-link audit task_id=%s clip_index=%s cover_url=%s matched_link=%s",
+                        task_id,
+                        violation["clipIndex"],
+                        violation["coverUrl"],
+                        violation["matchedLink"],
+                    )
+                    return
+
             subtitle_settings = self.load_subtitle_settings_snapshot()
             self.update_task_status(
                 task_id,
@@ -3291,6 +4583,13 @@ class AccountService:
                 export_version,
                 effective_export_progress,
                 next_status,
+            )
+
+        try:
+            self._run_stage_with_auto_retries(
+                task_id,
+                stage_label="huasheng-progress",
+                runner=run_once,
             )
         except Exception as exc:
             if self._is_missing_task_error(exc):
@@ -3505,6 +4804,28 @@ class AccountService:
             lines = lines[1:]
             while lines and not lines[0].strip():
                 lines.pop(0)
+        return "\n".join(lines).strip()
+
+    def _strip_markdown_code_fence(self, text: str) -> str:
+        normalized = str(text or "").strip()
+        if not normalized.startswith("```"):
+            return normalized
+
+        lines = normalized.splitlines()
+        if not lines:
+            return normalized
+
+        first_line = lines[0].strip()
+        if not first_line.startswith("```"):
+            return normalized
+
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
         return "\n".join(lines).strip()
 
     def _build_model_authorization_header(self, api_key: str) -> str:

@@ -22,7 +22,8 @@ const DEFAULT_MODEL_SETTINGS = {
 }
 const DEFAULT_GLOBAL_SETTINGS = {
   threadPoolSize: 3,
-  downloadDir: ''
+  downloadDir: '',
+  checkWebsiteLinks: false
 }
 const DEFAULT_HUASHENG_VOICE_SETTINGS = {
   voiceId: 0,
@@ -31,7 +32,8 @@ const DEFAULT_HUASHENG_VOICE_SETTINGS = {
   voiceTags: '',
   previewUrl: '',
   cover: '',
-  speechRate: 1
+  speechRate: 1,
+  maxConcurrentTasksPerAccount: 1
 }
 const DEFAULT_SUBTITLE_FONT_SIZE_OPTIONS = [
   { label: '超小号', value: 22 },
@@ -106,6 +108,29 @@ const searchKeyword = ref('')
 const lastSyncedAt = ref('')
 const activeDebugTab = ref('tts')
 const activeSettingsTab = ref('huasheng')
+const visitedSections = reactive({
+  accounts: true,
+  tasks: false,
+  benchmarkAccounts: false,
+  articleMonitoring: false,
+  articleLibrary: false,
+  debug: false,
+  settings: false
+})
+const visitedDebugTabs = reactive({
+  tts: true,
+  project: false,
+  imageOcr: false,
+  rewrite: false,
+  title: false
+})
+const visitedSettingsTabs = reactive({
+  global: false,
+  huasheng: true,
+  ocr: false,
+  microheadline: false,
+  model: false
+})
 const ttsLoading = ref(false)
 const ttsSourceTab = ref('public')
 const ttsPlaybackRate = ref(1)
@@ -128,6 +153,7 @@ const taskDeleteDialogOpen = ref(false)
 const taskDeleteLoading = ref(false)
 const taskRecords = ref([])
 const downloadingTaskIds = ref([])
+const retryingTaskIds = ref([])
 const currentProjectTaskRecordId = ref(null)
 const projectLoading = ref(false)
 const projectPolling = ref(false)
@@ -169,6 +195,10 @@ const globalSettingsLoading = ref(false)
 const globalSettingsSaving = ref(false)
 const globalSettingsLoaded = ref(false)
 const globalSettingsLastSavedAt = ref('')
+const ocrModelStatusLoading = ref(false)
+const ocrModelDownloadLoading = ref(false)
+const ocrModelStatusLoaded = ref(false)
+const ocrModelStatus = ref(null)
 const modelSettingsLoading = ref(false)
 const modelSettingsSaving = ref(false)
 const modelConnectionLoading = ref(false)
@@ -211,6 +241,12 @@ const titleForm = reactive({
   model: '',
   titlePrompt: '',
   article: ''
+})
+const imageOcrLoading = ref(false)
+const imageOcrErrorMessage = ref('')
+const imageOcrResult = ref(null)
+const imageOcrForm = reactive({
+  imagePath: ''
 })
 const form = reactive({
   id: null,
@@ -276,6 +312,11 @@ const debugTabs = [
     description: '选择发布账号并发起 project/create 调试请求'
   },
   {
+    key: 'imageOcr',
+    label: '图片初审',
+    description: '选择一张图片，用 PaddleOCR 识别其中的文字内容'
+  },
+  {
     key: 'rewrite',
     label: '文章改写',
     description: '使用数据库提示词调用模型改写文章'
@@ -297,6 +338,11 @@ const settingsTabs = [
     key: 'huasheng',
     label: '花生设置',
     description: '字幕字号、字幕样式和默认音色'
+  },
+  {
+    key: 'ocr',
+    label: 'OCR 设置',
+    description: '检查模型状态并下载本地 OCR 模型'
   },
   {
     key: 'model',
@@ -558,16 +604,30 @@ const subtitleSettingsSummary = computed(() => {
 })
 
 const huashengVoiceSummary = computed(() => {
+  const concurrentLabel = `单账号并发 ${normalizeHuashengMaxConcurrentTasks(
+    huashengVoiceSettings.maxConcurrentTasksPerAccount
+  )}`
   if (Number(huashengVoiceSettings.voiceId) <= 0 || !huashengVoiceSettings.voiceName) {
-    return '未设置默认音色'
+    return `未设置默认音色 · ${concurrentLabel}`
   }
 
-  return `${huashengVoiceSettings.voiceName} · ${Number(huashengVoiceSettings.speechRate || 1).toFixed(1)}x`
+  return `${huashengVoiceSettings.voiceName} · ${Number(huashengVoiceSettings.speechRate || 1).toFixed(1)}x · ${concurrentLabel}`
 })
 
 const globalSettingsSummary = computed(() => {
   const downloadLabel = globalSettings.downloadDir ? '已设置下载目录' : '未设置下载目录'
-  return `线程池 ${Number(globalSettings.threadPoolSize || DEFAULT_GLOBAL_SETTINGS.threadPoolSize)} 个线程 · ${downloadLabel}`
+  const websiteCheckLabel = normalizeGlobalCheckWebsiteLinks(globalSettings.checkWebsiteLinks)
+    ? '网址审核开启'
+    : '网址审核关闭'
+  return `线程池 ${Number(globalSettings.threadPoolSize || DEFAULT_GLOBAL_SETTINGS.threadPoolSize)} 个线程 · ${downloadLabel} · ${websiteCheckLabel}`
+})
+
+const ocrModelSummary = computed(() => {
+  if (!ocrModelStatus.value) {
+    return '尚未检查 OCR 模型状态'
+  }
+
+  return String(ocrModelStatus.value.message || '').trim() || 'OCR 状态未知'
 })
 
 const displayAppVersion = computed(() => {
@@ -609,12 +669,16 @@ const selectedRewritePrompt = computed(() => {
   )
 })
 
+const imageOcrFileName = computed(() => {
+  return getPathTail(imageOcrForm.imagePath)
+})
+
 const taskCount = computed(() => {
   return taskRecords.value.length
 })
 
 const taskStatusCounts = computed(() => {
-  return buildTaskStatusSummaryItems(taskRecords.value, (task) => task.status)
+  return buildTaskStatusSummaryItems(taskRecords.value, (task) => getTaskDisplayStatus(task))
 })
 
 const taskHuashengStatusCounts = computed(() => {
@@ -632,8 +696,29 @@ function nextRewritePromptId() {
   return `prompt-${Date.now()}-${rewritePromptSeed}`
 }
 
-function switchSection(section) {
+function setActiveSection(section) {
+  if (section && Object.prototype.hasOwnProperty.call(visitedSections, section)) {
+    visitedSections[section] = true
+  }
   activeSection.value = section
+}
+
+function setActiveDebugTab(tabKey) {
+  if (tabKey && Object.prototype.hasOwnProperty.call(visitedDebugTabs, tabKey)) {
+    visitedDebugTabs[tabKey] = true
+  }
+  activeDebugTab.value = tabKey
+}
+
+function setActiveSettingsTab(tabKey) {
+  if (tabKey && Object.prototype.hasOwnProperty.call(visitedSettingsTabs, tabKey)) {
+    visitedSettingsTabs[tabKey] = true
+  }
+  activeSettingsTab.value = tabKey
+}
+
+function switchSection(section) {
+  setActiveSection(section)
   if (section !== 'accounts') {
     accountDialogOpen.value = false
     resetForm()
@@ -680,7 +765,7 @@ function switchSection(section) {
 }
 
 function activateDebugTab(tabKey) {
-  activeDebugTab.value = tabKey
+  setActiveDebugTab(tabKey)
   if (tabKey === 'project' && selectedTtsVoiceId.value) {
     projectForm.voiceId = Number(selectedTtsVoiceId.value)
   }
@@ -694,7 +779,7 @@ function activateDebugTab(tabKey) {
 }
 
 function activateSettingsTab(tabKey) {
-  activeSettingsTab.value = tabKey
+  setActiveSettingsTab(tabKey)
   if (tabKey === 'global' && desktopReady.value && !globalSettingsLoaded.value) {
     loadGlobalSettings('全局设置已载入')
   }
@@ -703,6 +788,9 @@ function activateSettingsTab(tabKey) {
   }
   if (tabKey === 'huasheng' && desktopReady.value && !huashengVoiceSettingsLoaded.value) {
     loadHuashengVoiceSettings('音色设置已载入')
+  }
+  if (tabKey === 'ocr' && desktopReady.value && !ocrModelStatusLoaded.value) {
+    loadOcrModelStatus('OCR 模型状态已载入')
   }
   if (tabKey === 'model' && desktopReady.value && !modelSettingsLoaded.value) {
     loadModelSettings('模型设置已载入')
@@ -718,7 +806,7 @@ function resetForm() {
 }
 
 function openCreateAccountDialog() {
-  activeSection.value = 'accounts'
+  setActiveSection('accounts')
   resetForm()
   accountDialogOpen.value = true
   statusMessage.value = '准备新增账号'
@@ -762,6 +850,10 @@ function isTaskDownloading(taskId) {
   return downloadingTaskIds.value.includes(Number(taskId) || 0)
 }
 
+function isTaskRetrying(taskId) {
+  return retryingTaskIds.value.includes(Number(taskId) || 0)
+}
+
 function setTaskDownloading(taskId, downloading) {
   const normalizedTaskId = Number(taskId) || 0
   if (normalizedTaskId <= 0) {
@@ -776,6 +868,27 @@ function setTaskDownloading(taskId, downloading) {
   }
 
   downloadingTaskIds.value = downloadingTaskIds.value.filter((item) => item !== normalizedTaskId)
+}
+
+function setTaskRetrying(taskId, retrying) {
+  const normalizedTaskId = Number(taskId) || 0
+  if (normalizedTaskId <= 0) {
+    return
+  }
+
+  if (retrying) {
+    if (!retryingTaskIds.value.includes(normalizedTaskId)) {
+      retryingTaskIds.value = [...retryingTaskIds.value, normalizedTaskId]
+    }
+    return
+  }
+
+  retryingTaskIds.value = retryingTaskIds.value.filter((item) => item !== normalizedTaskId)
+}
+
+function isTaskRetryable(task) {
+  const status = String(task?.status || '').trim()
+  return ['S1失败', 'S2失败', 'S3失败', 'S4失败'].includes(status)
 }
 
 function stopProjectPolling() {
@@ -857,7 +970,10 @@ function resolveHuashengVoiceSettings(rawSettings) {
     speechRate:
       Number.isFinite(speechRate) && speechRate >= 0.5 && speechRate <= 2
         ? Number(speechRate.toFixed(1))
-        : DEFAULT_HUASHENG_VOICE_SETTINGS.speechRate
+        : DEFAULT_HUASHENG_VOICE_SETTINGS.speechRate,
+    maxConcurrentTasksPerAccount: normalizeHuashengMaxConcurrentTasks(
+      rawSettings?.maxConcurrentTasksPerAccount
+    )
   }
 }
 
@@ -892,6 +1008,7 @@ function applyHuashengVoiceSettingsPayload(payload) {
   huashengVoiceSettings.previewUrl = settings.previewUrl
   huashengVoiceSettings.cover = settings.cover
   huashengVoiceSettings.speechRate = settings.speechRate
+  huashengVoiceSettings.maxConcurrentTasksPerAccount = settings.maxConcurrentTasksPerAccount
   huashengVoiceSettingsLoaded.value = true
   huashengVoiceLastSavedAt.value = String(payload?.updatedAt || '')
 
@@ -950,6 +1067,32 @@ function normalizeGlobalThreadPoolSize(value) {
 
 function normalizeGlobalDownloadDir(value) {
   return String(value || '').trim()
+}
+
+function normalizeGlobalCheckWebsiteLinks(value) {
+  if (typeof value === 'boolean') {
+    return value
+  }
+
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) {
+    return DEFAULT_GLOBAL_SETTINGS.checkWebsiteLinks
+  }
+  if (['1', 'true', 'yes', 'y', 'on', '是', '开', '开启'].includes(normalized)) {
+    return true
+  }
+  if (['0', 'false', 'no', 'n', 'off', '否', '关', '关闭'].includes(normalized)) {
+    return false
+  }
+  return DEFAULT_GLOBAL_SETTINGS.checkWebsiteLinks
+}
+
+function normalizeHuashengMaxConcurrentTasks(value) {
+  const normalized = Number(value)
+  if (!Number.isFinite(normalized)) {
+    return DEFAULT_HUASHENG_VOICE_SETTINGS.maxConcurrentTasksPerAccount
+  }
+  return Math.max(1, Math.min(50, Math.round(normalized)))
 }
 
 function getPathTail(path) {
@@ -1058,8 +1201,36 @@ function applyGlobalSettingsPayload(payload) {
   const settings = payload?.settings || {}
   globalSettings.threadPoolSize = normalizeGlobalThreadPoolSize(settings.threadPoolSize)
   globalSettings.downloadDir = normalizeGlobalDownloadDir(settings.downloadDir)
+  globalSettings.checkWebsiteLinks = normalizeGlobalCheckWebsiteLinks(settings.checkWebsiteLinks)
   globalSettingsLoaded.value = true
   globalSettingsLastSavedAt.value = String(payload?.updatedAt || '')
+
+  if (payload?.databasePath) {
+    databasePath.value = payload.databasePath
+  }
+}
+
+function applyOcrModelStatusPayload(payload) {
+  ocrModelStatus.value = {
+    engine: String(payload?.engine || 'PaddleOCR'),
+    status: String(payload?.status || ''),
+    ready: Boolean(payload?.ready),
+    message: String(payload?.message || ''),
+    dependenciesReady: Boolean(payload?.dependenciesReady),
+    dependencyItems: Array.isArray(payload?.dependencyItems) ? payload.dependencyItems : [],
+    cacheDir: String(payload?.cacheDir || ''),
+    cacheExists: Boolean(payload?.cacheExists),
+    cacheWritable: Boolean(payload?.cacheWritable),
+    cacheWritableMessage: String(payload?.cacheWritableMessage || ''),
+    artifactFileCount: Number(payload?.artifactFileCount || 0),
+    artifactDirectoryCount: Number(payload?.artifactDirectoryCount || 0),
+    cacheSizeBytes: Number(payload?.cacheSizeBytes || 0),
+    sampleFiles: Array.isArray(payload?.sampleFiles) ? payload.sampleFiles : [],
+    engineInitialized: Boolean(payload?.engineInitialized),
+    verified: Boolean(payload?.verified),
+    verifiedAt: String(payload?.verifiedAt || '')
+  }
+  ocrModelStatusLoaded.value = true
 
   if (payload?.databasePath) {
     databasePath.value = payload.databasePath
@@ -1118,7 +1289,8 @@ async function saveGlobalSettings() {
     const payload = await callDesktop(
       'save_global_settings',
       normalizeGlobalThreadPoolSize(globalSettings.threadPoolSize),
-      normalizeGlobalDownloadDir(globalSettings.downloadDir)
+      normalizeGlobalDownloadDir(globalSettings.downloadDir),
+      normalizeGlobalCheckWebsiteLinks(globalSettings.checkWebsiteLinks)
     )
     applyGlobalSettingsPayload(payload)
     statusMessage.value = `全局设置已保存到数据库 · ${globalSettingsSummary.value}`
@@ -1126,6 +1298,54 @@ async function saveGlobalSettings() {
     statusMessage.value = `保存全局设置失败: ${error instanceof Error ? error.message : String(error)}`
   } finally {
     globalSettingsSaving.value = false
+  }
+}
+
+async function loadOcrModelStatus(message = 'OCR 模型状态已载入') {
+  if (!desktopReady.value) {
+    return null
+  }
+
+  ocrModelStatusLoading.value = true
+
+  try {
+    const payload = await callDesktop('get_ocr_model_status')
+    if (!payload?.success) {
+      throw new Error(payload?.errorMessage || 'OCR 模型状态检查失败')
+    }
+    applyOcrModelStatusPayload(payload)
+    statusMessage.value = `${message} · ${ocrModelSummary.value}`
+    return payload
+  } catch (error) {
+    ocrModelStatusLoaded.value = false
+    statusMessage.value = `检查 OCR 模型失败: ${error instanceof Error ? error.message : String(error)}`
+    return null
+  } finally {
+    ocrModelStatusLoading.value = false
+  }
+}
+
+async function downloadOcrModel() {
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+
+  ocrModelDownloadLoading.value = true
+
+  try {
+    const payload = await callDesktop('download_ocr_model')
+    if (!payload?.success) {
+      throw new Error(payload?.errorMessage || 'OCR 模型下载失败')
+    }
+    applyOcrModelStatusPayload(payload)
+    statusMessage.value = payload?.downloaded
+      ? 'OCR 模型已下载并完成校验'
+      : `OCR 模型已就绪 · ${ocrModelSummary.value}`
+  } catch (error) {
+    statusMessage.value = `下载 OCR 模型失败: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    ocrModelDownloadLoading.value = false
   }
 }
 
@@ -1439,6 +1659,61 @@ async function generateTitleWithModel() {
   }
 }
 
+async function chooseImageForOcr() {
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+
+  try {
+    const payload = await callDesktop('select_image_file', imageOcrForm.imagePath)
+    const selectedPath = String(payload?.selectedPath || '').trim()
+    if (!selectedPath) {
+      statusMessage.value = '已取消选择图片'
+      return
+    }
+    imageOcrForm.imagePath = selectedPath
+    imageOcrResult.value = null
+    imageOcrErrorMessage.value = ''
+    statusMessage.value = `已选择图片：${selectedPath}`
+  } catch (error) {
+    imageOcrErrorMessage.value = `选择图片失败: ${error instanceof Error ? error.message : String(error)}`
+    statusMessage.value = imageOcrErrorMessage.value
+  }
+}
+
+async function runImageOcr() {
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+  if (!String(imageOcrForm.imagePath || '').trim()) {
+    imageOcrErrorMessage.value = '请先选择一张图片'
+    statusMessage.value = imageOcrErrorMessage.value
+    return
+  }
+
+  imageOcrLoading.value = true
+  try {
+    const payload = await callDesktop('ocr_image_text', imageOcrForm.imagePath)
+    if (payload?.success === false) {
+      imageOcrResult.value = null
+      imageOcrErrorMessage.value = getModelActionMessage(payload, '图片 OCR 识别失败')
+      statusMessage.value = imageOcrErrorMessage.value
+      return
+    }
+    imageOcrResult.value = payload
+    imageOcrErrorMessage.value = ''
+    statusMessage.value = `图片 OCR 完成，共识别 ${Number(payload?.lineCount || 0)} 行文本`
+  } catch (error) {
+    imageOcrResult.value = null
+    imageOcrErrorMessage.value = `图片 OCR 识别失败: ${error instanceof Error ? error.message : String(error)}`
+    statusMessage.value = imageOcrErrorMessage.value
+  } finally {
+    imageOcrLoading.value = false
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
@@ -1711,7 +1986,9 @@ function applyPayload(payload) {
 }
 
 function applyTaskPayload(payload) {
-  taskRecords.value = payload.items ?? []
+  taskRecords.value = [...(payload.items ?? [])].sort(
+    (left, right) => Number(right?.id || 0) - Number(left?.id || 0)
+  )
   if (payload?.databasePath) {
     databasePath.value = payload.databasePath
   }
@@ -1796,6 +2073,37 @@ async function downloadTaskVideo(task) {
     statusMessage.value = `下载视频失败: ${error instanceof Error ? error.message : String(error)}`
   } finally {
     setTaskDownloading(taskId, false)
+  }
+}
+
+async function retryTaskRecord(task) {
+  const taskId = Number(task?.id) || 0
+  if (taskId <= 0) {
+    statusMessage.value = '任务数据无效，无法重试'
+    return
+  }
+  if (!isTaskRetryable(task)) {
+    statusMessage.value = '当前任务不是失败状态，无法重试'
+    return
+  }
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+  if (isTaskRetrying(taskId)) {
+    return
+  }
+
+  setTaskRetrying(taskId, true)
+
+  try {
+    const payload = await callDesktop('retry_task_record', taskId)
+    await loadTasks('任务列表已同步', { silent: true })
+    statusMessage.value = `任务 #${taskId} 已重试，当前状态 ${payload?.status || '--'}`
+  } catch (error) {
+    statusMessage.value = `重试任务失败: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    setTaskRetrying(taskId, false)
   }
 }
 
@@ -1926,7 +2234,8 @@ async function saveHuashengVoiceSettingsFromSelection() {
       getVoiceTags(selectedTtsVoice.value),
       getVoicePreviewUrl(selectedTtsVoice.value),
       selectedTtsVoice.value.cover || '',
-      Number(ttsPlaybackRate.value) || 1
+      Number(ttsPlaybackRate.value) || 1,
+      normalizeHuashengMaxConcurrentTasks(huashengVoiceSettings.maxConcurrentTasksPerAccount)
     )
     applyHuashengVoiceSettingsPayload(payload)
     closeVoicePicker()
@@ -1934,6 +2243,37 @@ async function saveHuashengVoiceSettingsFromSelection() {
     return payload
   } catch (error) {
     statusMessage.value = `保存音色设置失败: ${error instanceof Error ? error.message : String(error)}`
+    return null
+  } finally {
+    huashengVoiceSettingsSaving.value = false
+  }
+}
+
+async function saveHuashengVoiceSettings() {
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return null
+  }
+
+  huashengVoiceSettingsSaving.value = true
+
+  try {
+    const payload = await callDesktop(
+      'save_huasheng_voice_settings',
+      Number(huashengVoiceSettings.voiceId) || 0,
+      huashengVoiceSettings.voiceName || '',
+      huashengVoiceSettings.voiceCode || '',
+      huashengVoiceSettings.voiceTags || '',
+      huashengVoiceSettings.previewUrl || '',
+      huashengVoiceSettings.cover || '',
+      Number(huashengVoiceSettings.speechRate) || DEFAULT_HUASHENG_VOICE_SETTINGS.speechRate,
+      normalizeHuashengMaxConcurrentTasks(huashengVoiceSettings.maxConcurrentTasksPerAccount)
+    )
+    applyHuashengVoiceSettingsPayload(payload)
+    statusMessage.value = `花生设置已保存到数据库 · ${huashengVoiceSummary.value}`
+    return payload
+  } catch (error) {
+    statusMessage.value = `保存花生设置失败: ${error instanceof Error ? error.message : String(error)}`
     return null
   } finally {
     huashengVoiceSettingsSaving.value = false
@@ -2071,6 +2411,22 @@ function formatDateTime(value) {
   return value.replace('T', ' ')
 }
 
+function formatByteSize(value) {
+  const size = Number(value || 0)
+  if (!Number.isFinite(size) || size <= 0) {
+    return '--'
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let currentSize = size
+  let index = 0
+  while (currentSize >= 1024 && index < units.length - 1) {
+    currentSize /= 1024
+    index += 1
+  }
+  return `${currentSize >= 100 || index === 0 ? currentSize.toFixed(0) : currentSize.toFixed(1)} ${units[index]}`
+}
+
 function getTaskTextPreview(value, limit = 64) {
   const text = String(value || '').trim()
   if (!text) {
@@ -2105,6 +2461,22 @@ function isTaskHuashengProcessing(task) {
   return status === 'S4扫描中' || status === 'S4导出中'
 }
 
+function isTaskWaitingForAvailableAccount(task) {
+  const status = String(task?.status || '').trim()
+  const huashengStatus = String(task?.huashengStatus || '').trim()
+  return (
+    status === '待创建花生任务' &&
+    huashengStatus === '暂无可用花生账号，等待下次扫描'
+  )
+}
+
+function getTaskDisplayStatus(task) {
+  if (isTaskWaitingForAvailableAccount(task)) {
+    return '等待可用账号'
+  }
+  return String(task?.status || '').trim() || '--'
+}
+
 function getTaskStatusDetail(task) {
   const status = String(task?.status || '').trim()
   const progress = Number(task?.progress || 0)
@@ -2112,6 +2484,14 @@ function getTaskStatusDetail(task) {
 
   if (status === '待处理') {
     return '排队中'
+  }
+
+  if (status === '触发红线') {
+    return huashengStatus || '禁止改写'
+  }
+
+  if (isTaskWaitingForAvailableAccount(task)) {
+    return '下次扫描会自动重试'
   }
 
   if (isTaskHuashengProcessing(task)) {
@@ -2308,7 +2688,7 @@ function useSelectedVoiceForProject() {
     statusMessage.value = `已选择音色 ${selectedTtsVoice.value.name}，语速 ${projectForm.speechRate}`
     return
   }
-  activeDebugTab.value = 'project'
+  setActiveDebugTab('project')
   statusMessage.value = `已带入音色 ${selectedTtsVoice.value.name} 到创建任务，语速 ${projectForm.speechRate}`
 }
 
@@ -2347,7 +2727,7 @@ async function openSettingsVoicePicker() {
 }
 
 function editAccount(account) {
-  activeSection.value = 'accounts'
+  setActiveSection('accounts')
   form.id = account.id
   form.phone = account.phone
   form.cookies = account.cookies
@@ -2731,7 +3111,11 @@ watch(selectedTtsVoiceId, (value) => {
     </aside>
 
     <section class="content-shell">
-      <section v-if="activeSection === 'accounts'" class="page-body accounts-page">
+      <section
+        v-if="visitedSections.accounts"
+        v-show="activeSection === 'accounts'"
+        class="page-body accounts-page"
+      >
         <div class="list-toolbar">
           <label class="search-field">
             <input
@@ -2791,6 +3175,9 @@ watch(selectedTtsVoiceId, (value) => {
                   <p class="account-generation-count">
                     今日制作 {{ account.todayGenerationCount ?? 0 }}/{{ account.dailyGenerationLimit ?? 50 }}
                   </p>
+                  <p class="account-generation-count">
+                    活跃花生任务 {{ account.activeHuashengTaskCount ?? 0 }}/{{ account.maxConcurrentTasksPerAccount ?? 1 }}
+                  </p>
                 </div>
                 <span class="status-chip" :data-disabled="account.isDisabled">
                   {{ account.isDisabled ? '已禁用' : '正常可用' }}
@@ -2838,7 +3225,11 @@ watch(selectedTtsVoiceId, (value) => {
           </div>
       </section>
 
-      <section v-else-if="activeSection === 'tasks'" class="page-body tasks-page">
+      <section
+        v-if="visitedSections.tasks"
+        v-show="activeSection === 'tasks'"
+        class="page-body tasks-page"
+      >
         <div class="list-toolbar">
           <div class="tasks-toolbar-copy">
             <strong>任务列表</strong>
@@ -2885,6 +3276,7 @@ watch(selectedTtsVoiceId, (value) => {
               <span>ID</span>
               <span>标题 / 文本</span>
               <span>状态</span>
+              <span>重试</span>
               <span>下载</span>
             </div>
 
@@ -2902,11 +3294,23 @@ watch(selectedTtsVoiceId, (value) => {
               </span>
               <span class="task-cell task-cell-status">
                 <span class="task-status-content">
-                  <span class="task-status-chip">{{ task.status }}</span>
+                  <span class="task-status-chip">{{ getTaskDisplayStatus(task) }}</span>
                   <small v-if="getTaskStatusDetail(task)" class="task-status-detail">
                     {{ getTaskStatusDetail(task) }}
                   </small>
                 </span>
+              </span>
+              <span class="task-cell task-cell-actions">
+                <button
+                  v-if="isTaskRetryable(task)"
+                  type="button"
+                  class="toolbar-button secondary task-retry-button"
+                  :disabled="isTaskRetrying(task.id) || !desktopReady"
+                  @click="retryTaskRecord(task)"
+                >
+                  {{ isTaskRetrying(task.id) ? '重试中...' : '重试' }}
+                </button>
+                <span v-else class="task-download-placeholder">--</span>
               </span>
               <span class="task-cell task-cell-actions">
                 <button
@@ -2930,7 +3334,11 @@ watch(selectedTtsVoiceId, (value) => {
         </div>
       </section>
 
-      <section v-else-if="activeSection === 'benchmarkAccounts'" class="page-body benchmark-accounts-page">
+      <section
+        v-if="visitedSections.benchmarkAccounts"
+        v-show="activeSection === 'benchmarkAccounts'"
+        class="page-body benchmark-accounts-page"
+      >
         <BenchmarkAccountsSection
           :desktop-ready="desktopReady"
           @status="statusMessage = $event"
@@ -2938,7 +3346,11 @@ watch(selectedTtsVoiceId, (value) => {
         />
       </section>
 
-      <section v-else-if="activeSection === 'articleMonitoring'" class="page-body article-monitoring-page">
+      <section
+        v-if="visitedSections.articleMonitoring"
+        v-show="activeSection === 'articleMonitoring'"
+        class="page-body article-monitoring-page"
+      >
         <ArticleMonitoringSection
           :desktop-ready="desktopReady"
           @status="statusMessage = $event"
@@ -2946,7 +3358,11 @@ watch(selectedTtsVoiceId, (value) => {
         />
       </section>
 
-      <section v-else-if="activeSection === 'articleLibrary'" class="page-body article-library-page">
+      <section
+        v-if="visitedSections.articleLibrary"
+        v-show="activeSection === 'articleLibrary'"
+        class="page-body article-library-page"
+      >
         <ArticleLibrarySection
           :desktop-ready="desktopReady"
           @status="statusMessage = $event"
@@ -2955,7 +3371,11 @@ watch(selectedTtsVoiceId, (value) => {
         />
       </section>
 
-      <section v-else-if="activeSection === 'debug'" class="page-body debug-page">
+      <section
+        v-if="visitedSections.debug"
+        v-show="activeSection === 'debug'"
+        class="page-body debug-page"
+      >
         <div class="debug-shell">
           <div class="debug-tabs" role="tablist" aria-label="Debug tabs">
             <button
@@ -2971,7 +3391,11 @@ watch(selectedTtsVoiceId, (value) => {
             </button>
           </div>
 
-          <section v-if="activeDebugTab === 'tts'" class="debug-panel">
+          <section
+            v-if="visitedDebugTabs.tts"
+            v-show="activeDebugTab === 'tts'"
+            class="debug-panel"
+          >
             <article class="tts-lab">
               <div class="tts-lab-header">
                 <div>
@@ -3129,7 +3553,11 @@ watch(selectedTtsVoiceId, (value) => {
             </article>
           </section>
 
-          <section v-else-if="activeDebugTab === 'project'" class="debug-panel">
+          <section
+            v-if="visitedDebugTabs.project"
+            v-show="activeDebugTab === 'project'"
+            class="debug-panel"
+          >
             <article class="tts-lab project-lab">
               <div class="tts-lab-header">
                 <div>
@@ -3335,7 +3763,120 @@ watch(selectedTtsVoiceId, (value) => {
             </article>
           </section>
 
-          <section v-else-if="activeDebugTab === 'rewrite'" class="debug-panel">
+          <section
+            v-if="visitedDebugTabs.imageOcr"
+            v-show="activeDebugTab === 'imageOcr'"
+            class="debug-panel"
+          >
+            <article class="tts-lab model-debug-lab image-ocr-lab">
+              <div class="tts-lab-header">
+                <div>
+                  <p class="tts-caption">OCR 调试台</p>
+                  <h2>图片初审</h2>
+                  <p class="tts-description">选择一张本地图片，使用 PaddleOCR 识别图片中的文本内容并直接展示结果。</p>
+                </div>
+                <div class="model-debug-actions">
+                  <button
+                    type="button"
+                    class="toolbar-button secondary"
+                    :disabled="imageOcrLoading || !desktopReady"
+                    @click="chooseImageForOcr"
+                  >
+                    选择图片
+                  </button>
+                  <button
+                    type="button"
+                    class="tts-primary-button model-debug-run-button"
+                    :disabled="imageOcrLoading || !desktopReady"
+                    @click="runImageOcr"
+                  >
+                    {{ imageOcrLoading ? '识别中...' : '开始识别' }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="tts-account-strip">
+                <div class="tts-account-card">
+                  <span>当前文件</span>
+                  <strong>{{ imageOcrFileName }}</strong>
+                  <small>{{ imageOcrForm.imagePath || '还没有选择图片' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>识别引擎</span>
+                  <strong>{{ imageOcrResult?.engine || 'PaddleOCR' }}</strong>
+                  <small>{{ imageOcrLoading ? '首次使用会下载并初始化 OCR 模型' : '支持 PNG/JPG/JPEG/BMP/WEBP/TIF/TIFF' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>识别结果</span>
+                  <strong>{{ imageOcrResult ? `${Number(imageOcrResult.lineCount || 0)} 行` : '--' }}</strong>
+                  <small>{{ imageOcrResult?.text ? `${imageOcrResult.text.length} 个字符` : '识别完成后会展示在下方' }}</small>
+                </div>
+              </div>
+
+              <section class="settings-block">
+                <div class="settings-block-head">
+                  <strong>图片路径</strong>
+                  <small>点击按钮从本地选择一张待识别图片</small>
+                </div>
+                <div class="image-ocr-picker-row">
+                  <label class="form-field image-ocr-path-field">
+                    <span>本地图片</span>
+                    <input
+                      v-model="imageOcrForm.imagePath"
+                      type="text"
+                      readonly
+                      placeholder="请选择一张图片"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="toolbar-button secondary image-ocr-picker-button"
+                    :disabled="imageOcrLoading || !desktopReady"
+                    @click="chooseImageForOcr"
+                  >
+                    重新选择
+                  </button>
+                </div>
+              </section>
+
+              <section class="settings-block">
+                <div class="settings-block-head">
+                  <strong>识别结果</strong>
+                  <small>返回按行拼接后的纯文本内容</small>
+                </div>
+                <div v-if="imageOcrResult?.text" class="model-debug-result-card">
+                  <pre class="model-debug-result">{{ imageOcrResult.text }}</pre>
+                  <div class="model-debug-result-actions">
+                    <span class="prompt-toolbar-meta">
+                      {{ imageOcrResult.engine }} · {{ Number(imageOcrResult.lineCount || 0) }} 行
+                    </span>
+                    <button
+                      type="button"
+                      class="toolbar-button secondary"
+                      @click="copyText(imageOcrResult.text)"
+                    >
+                      复制内容
+                    </button>
+                  </div>
+                </div>
+                <div v-else-if="imageOcrResult" class="tts-empty-state">
+                  识别完成，但当前图片没有提取到文本。
+                </div>
+                <div v-else-if="imageOcrErrorMessage" class="tts-empty-state">
+                  {{ imageOcrErrorMessage }}
+                </div>
+                <div v-else class="tts-empty-state">
+                  还没有识别结果，先选择图片再点击“开始识别”。
+                </div>
+              </section>
+            </article>
+          </section>
+
+          <section
+            v-if="visitedDebugTabs.rewrite"
+            v-show="activeDebugTab === 'rewrite'"
+            class="debug-panel"
+          >
             <article class="tts-lab model-debug-lab">
               <div class="tts-lab-header">
                 <div>
@@ -3503,7 +4044,11 @@ watch(selectedTtsVoiceId, (value) => {
             </article>
           </section>
 
-          <section v-else-if="activeDebugTab === 'title'" class="debug-panel">
+          <section
+            v-if="visitedDebugTabs.title"
+            v-show="activeDebugTab === 'title'"
+            class="debug-panel"
+          >
             <article class="tts-lab model-debug-lab">
               <div class="tts-lab-header">
                 <div>
@@ -3656,7 +4201,11 @@ watch(selectedTtsVoiceId, (value) => {
         </div>
       </section>
 
-      <section v-else class="page-body settings-page">
+      <section
+        v-if="visitedSections.settings"
+        v-show="activeSection === 'settings'"
+        class="page-body settings-page"
+      >
         <div class="settings-shell">
           <div class="settings-tabs" role="tablist" aria-label="Settings tabs">
             <button
@@ -3672,7 +4221,11 @@ watch(selectedTtsVoiceId, (value) => {
             </button>
           </div>
 
-          <article v-if="activeSettingsTab === 'global'" class="tts-lab settings-panel">
+          <article
+            v-if="visitedSettingsTabs.global"
+            v-show="activeSettingsTab === 'global'"
+            class="tts-lab settings-panel"
+          >
             <div class="tts-lab-header">
               <div>
                 <p class="tts-caption">全局设置</p>
@@ -3756,6 +4309,22 @@ watch(selectedTtsVoiceId, (value) => {
             </section>
 
             <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>S4 封面审核</strong>
+                <small>项目处理完成后，可选地对每个 clip 封面做 OCR，识别到网址时直接判定任务失败</small>
+              </div>
+              <div class="settings-form-grid global-settings-grid">
+                <label class="form-field">
+                  <span>是否判断网址</span>
+                  <select v-model="globalSettings.checkWebsiteLinks">
+                    <option :value="true">开启</option>
+                    <option :value="false">关闭</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-block">
               <div class="tts-account-strip voice-settings-strip">
                 <div class="tts-account-card">
                   <span>当前线程池</span>
@@ -3773,6 +4342,11 @@ watch(selectedTtsVoiceId, (value) => {
                   <small>{{ globalSettings.downloadDir || '还没有保存默认下载路径' }}</small>
                 </div>
                 <div class="tts-account-card">
+                  <span>网址审核</span>
+                  <strong>{{ normalizeGlobalCheckWebsiteLinks(globalSettings.checkWebsiteLinks) ? '开启' : '关闭' }}</strong>
+                  <small>{{ normalizeGlobalCheckWebsiteLinks(globalSettings.checkWebsiteLinks) ? 'S4 完成后会先做封面 OCR 链接检查' : '当前不会执行封面 OCR 链接检查' }}</small>
+                </div>
+                <div class="tts-account-card">
                   <span>当前版本</span>
                   <strong>{{ displayAppVersion }}</strong>
                   <small>版本号由桌面后端统一提供</small>
@@ -3786,7 +4360,11 @@ watch(selectedTtsVoiceId, (value) => {
             </section>
           </article>
 
-          <article v-else-if="activeSettingsTab === 'huasheng'" class="tts-lab settings-panel">
+          <article
+            v-if="visitedSettingsTabs.huasheng"
+            v-show="activeSettingsTab === 'huasheng'"
+            class="tts-lab settings-panel"
+          >
             <div class="tts-lab-header">
               <div>
                 <p class="tts-caption">花生设置</p>
@@ -3878,7 +4456,20 @@ watch(selectedTtsVoiceId, (value) => {
             <section class="settings-block">
               <div class="settings-block-head">
                 <strong>音色设置</strong>
-                <small>点击设置音色后会拉取最新音色列表，可试听并把音色与语速一起保存到数据库</small>
+                <small>点击设置音色后会拉取最新音色列表，可试听并把音色、语速和单账号并发数一起保存到数据库</small>
+              </div>
+              <div class="settings-form-grid">
+                <label class="form-field">
+                  <span>单账号并发任务数</span>
+                  <input
+                    v-model.number="huashengVoiceSettings.maxConcurrentTasksPerAccount"
+                    type="number"
+                    min="1"
+                    max="50"
+                    step="1"
+                    placeholder="请输入 1 到 50"
+                  />
+                </label>
               </div>
               <div class="tts-account-strip voice-settings-strip">
                 <div class="tts-account-card">
@@ -3897,6 +4488,11 @@ watch(selectedTtsVoiceId, (value) => {
                   <small>{{ huashengVoiceSettings.voiceCode || '未保存 voice code' }}</small>
                 </div>
                 <div class="tts-account-card">
+                  <span>单账号并发</span>
+                  <strong>{{ normalizeHuashengMaxConcurrentTasks(huashengVoiceSettings.maxConcurrentTasksPerAccount) }}</strong>
+                  <small>同一花生账号同时运行的任务上限</small>
+                </div>
+                <div class="tts-account-card">
                   <span>最近保存</span>
                   <strong>{{ huashengVoiceLastSavedAt || '--' }}</strong>
                   <small>{{ huashengVoiceSummary }}</small>
@@ -3913,6 +4509,14 @@ watch(selectedTtsVoiceId, (value) => {
                 </button>
                 <button
                   type="button"
+                  class="tts-primary-button settings-save-button"
+                  :disabled="huashengVoiceSettingsSaving || huashengVoiceSettingsLoading || !desktopReady"
+                  @click="saveHuashengVoiceSettings"
+                >
+                  {{ huashengVoiceSettingsSaving ? '保存中...' : '保存花生设置' }}
+                </button>
+                <button
+                  type="button"
                   class="toolbar-button secondary"
                   :disabled="huashengVoiceSettingsSaving || ttsLoading || !desktopReady"
                   @click="openSettingsVoicePicker"
@@ -3923,14 +4527,133 @@ watch(selectedTtsVoiceId, (value) => {
             </section>
           </article>
 
+          <article
+            v-if="visitedSettingsTabs.ocr"
+            v-show="activeSettingsTab === 'ocr'"
+            class="tts-lab settings-panel"
+          >
+            <div class="tts-lab-header">
+              <div>
+                <p class="tts-caption">OCR 设置</p>
+                <h2>模型检查与下载</h2>
+                <p class="tts-description">这里专门处理 PaddleOCR 的本地模型状态。检查只做依赖、缓存和校验记录判断；下载才会真正触发模型初始化。</p>
+              </div>
+              <div class="settings-toolbar">
+                <button
+                  type="button"
+                  class="toolbar-button secondary"
+                  :disabled="ocrModelStatusLoading || ocrModelDownloadLoading || !desktopReady"
+                  @click="loadOcrModelStatus('OCR 模型状态已刷新')"
+                >
+                  {{ ocrModelStatusLoading ? '检查中...' : '检查模型' }}
+                </button>
+                <button
+                  type="button"
+                  class="tts-primary-button settings-save-button"
+                  :disabled="ocrModelDownloadLoading || ocrModelStatusLoading || !desktopReady"
+                  @click="downloadOcrModel"
+                >
+                  {{ ocrModelDownloadLoading ? '下载中...' : '下载模型' }}
+                </button>
+              </div>
+            </div>
+
+            <section class="settings-block">
+              <div class="tts-account-strip voice-settings-strip">
+                <div class="tts-account-card">
+                  <span>当前引擎</span>
+                  <strong>{{ ocrModelStatus?.engine || 'PaddleOCR' }}</strong>
+                  <small>{{ ocrModelStatus?.message || '点击右上角检查模型状态' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>模型状态</span>
+                  <strong>{{ ocrModelStatus?.ready ? '已就绪' : '未就绪' }}</strong>
+                  <small>{{ ocrModelStatus?.status || '尚未检查' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>缓存体积</span>
+                  <strong>{{ formatByteSize(ocrModelStatus?.cacheSizeBytes) }}</strong>
+                  <small>{{ ocrModelStatus ? `${Number(ocrModelStatus.artifactFileCount || 0)} 个模型文件` : '尚未检查' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>校验记录</span>
+                  <strong>{{ ocrModelStatus?.verified ? '已验证' : '未验证' }}</strong>
+                  <small>{{ ocrModelStatus?.verifiedAt || '还没有成功校验记录' }}</small>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>缓存目录</strong>
+                <small>OCR 模型会缓存到数据库同级目录下的 `.paddle-cache/paddlex`</small>
+              </div>
+              <div class="tts-account-strip voice-settings-strip">
+                <div class="tts-account-card">
+                  <span>缓存路径</span>
+                  <strong>{{ getPathTail(ocrModelStatus?.cacheDir) }}</strong>
+                  <small>{{ ocrModelStatus?.cacheDir || '尚未检查' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>目录可写</span>
+                  <strong>{{ ocrModelStatus?.cacheWritable ? '可写' : '不可写' }}</strong>
+                  <small>{{ ocrModelStatus?.cacheWritableMessage || '尚未检查' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>模型目录数</span>
+                  <strong>{{ ocrModelStatus ? Number(ocrModelStatus.artifactDirectoryCount || 0) : '--' }}</strong>
+                  <small>{{ ocrModelStatus?.engineInitialized ? '本进程已经完成初始化' : '当前进程还没有初始化引擎' }}</small>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>依赖检查</strong>
+                <small>会检查 `paddleocr`、`paddlepaddle` 和 `paddlex` 是否安装且可导入</small>
+              </div>
+              <div class="tts-account-strip voice-settings-strip">
+                <div
+                  v-for="item in ocrModelStatus?.dependencyItems || []"
+                  :key="item.module"
+                  class="tts-account-card"
+                >
+                  <span>{{ item.package }}</span>
+                  <strong>{{ item.importable ? '可用' : item.installed ? '导入失败' : '未安装' }}</strong>
+                  <small>{{ item.errorMessage || item.module }}</small>
+                </div>
+              </div>
+            </section>
+
+            <section v-if="(ocrModelStatus?.sampleFiles || []).length" class="settings-block">
+              <div class="settings-block-head">
+                <strong>模型文件示例</strong>
+                <small>这里只展示前几条命中的模型文件，便于确认缓存是否已经落地</small>
+              </div>
+              <div class="tts-empty-state">
+                <div
+                  v-for="path in ocrModelStatus.sampleFiles"
+                  :key="path"
+                >
+                  {{ path }}
+                </div>
+              </div>
+            </section>
+          </article>
+
           <MicroheadlineSettingsPanel
-            v-else-if="activeSettingsTab === 'microheadline'"
+            v-if="visitedSettingsTabs.microheadline"
+            v-show="activeSettingsTab === 'microheadline'"
             :desktop-ready="desktopReady"
             @status="statusMessage = $event"
             @database-path="databasePath = $event"
           />
 
-          <article v-else class="tts-lab settings-panel">
+          <article
+            v-if="visitedSettingsTabs.model"
+            v-show="activeSettingsTab === 'model'"
+            class="tts-lab settings-panel"
+          >
             <div class="tts-lab-header">
               <div>
                 <p class="tts-caption">模型设置</p>

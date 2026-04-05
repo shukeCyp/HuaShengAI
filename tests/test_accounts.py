@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 from app.accounts import AccountService
 from app.database import close_database, database, init_database
-from app.models import HuashengGenerationRecord
+from app.models import (
+    BenchmarkAccount,
+    HuashengGenerationRecord,
+    MonitorRun,
+    MonitoredArticle,
+)
 
 
 class FakeResponse:
@@ -34,6 +39,11 @@ class FakeResponse:
         return None
 
 
+class FakePaddlePredictResult:
+    def __init__(self, payload) -> None:
+        self.json = payload
+
+
 class AccountServiceSubtitleSettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -45,6 +55,35 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
     def tearDown(self) -> None:
         close_database()
         self.temp_dir.cleanup()
+
+    def create_monitored_article(
+        self,
+        article_id: int,
+        *,
+        content: str,
+        title: str = "",
+        play_count: int = 0,
+    ) -> MonitoredArticle:
+        with database.connection_context():
+            account = BenchmarkAccount.create(
+                url=f"https://example.com/account/{article_id}",
+            )
+            run = MonitorRun.create(
+                benchmark_account=account,
+                source_url=account.url,
+                status="success",
+                article_count=1,
+            )
+            return MonitoredArticle.create(
+                id=article_id,
+                benchmark_account=account,
+                monitor_run=run,
+                dedupe_key=f"dedupe:{article_id}",
+                title=title,
+                content=content,
+                play_count=play_count,
+                isdelete=0,
+            )
 
     def test_get_subtitle_settings_payload_creates_default_settings(self) -> None:
         payload = self.service.get_subtitle_settings_payload()
@@ -84,6 +123,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
                 "previewUrl": "",
                 "cover": "",
                 "speechRate": 1.0,
+                "maxConcurrentTasksPerAccount": 1,
             },
         )
         self.assertEqual(payload["databasePath"], str(self.db_path))
@@ -97,6 +137,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             "https://example.com/preview.mp3",
             "https://example.com/cover.png",
             1.3,
+            2,
         )
         loaded = self.service.get_huasheng_voice_settings_payload()
 
@@ -107,6 +148,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(saved["settings"]["previewUrl"], "https://example.com/preview.mp3")
         self.assertEqual(saved["settings"]["cover"], "https://example.com/cover.png")
         self.assertEqual(saved["settings"]["speechRate"], 1.3)
+        self.assertEqual(saved["settings"]["maxConcurrentTasksPerAccount"], 2)
         self.assertEqual(loaded["settings"], saved["settings"])
 
     def test_list_payload_includes_today_generation_count(self) -> None:
@@ -124,14 +166,39 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         )
         self.service.create_huasheng_generation_record(account_one["id"], "pid-1")
         self.service.create_huasheng_generation_record(account_one["id"], "pid-2")
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.1,
+            2,
+        )
+        self.service.create_task_record(
+            account_one["id"],
+            "113671485575170",
+            "S4扫描中",
+            article_id=101,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="正文A",
+            title="标题A",
+            huasheng_status="处理中",
+        )
 
         payload = self.service.list_payload()
         items_by_id = {item["id"]: item for item in payload["items"]}
 
         self.assertEqual(items_by_id[account_one["id"]]["todayGenerationCount"], 2)
         self.assertEqual(items_by_id[account_one["id"]]["dailyGenerationLimit"], 50)
+        self.assertEqual(items_by_id[account_one["id"]]["activeHuashengTaskCount"], 1)
+        self.assertEqual(items_by_id[account_one["id"]]["maxConcurrentTasksPerAccount"], 2)
         self.assertEqual(items_by_id[account_two["id"]]["todayGenerationCount"], 0)
         self.assertEqual(items_by_id[account_two["id"]]["dailyGenerationLimit"], 50)
+        self.assertEqual(items_by_id[account_two["id"]]["activeHuashengTaskCount"], 0)
+        self.assertEqual(items_by_id[account_two["id"]]["maxConcurrentTasksPerAccount"], 2)
 
     def test_get_model_settings_payload_defaults_to_empty_values(self) -> None:
         payload = self.service.get_model_settings_payload()
@@ -154,6 +221,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
         self.assertEqual(payload["settings"]["threadPoolSize"], 3)
         self.assertEqual(payload["settings"]["downloadDir"], "")
+        self.assertFalse(payload["settings"]["checkWebsiteLinks"])
         self.assertEqual(payload["scanIntervalSeconds"], 5)
         self.assertEqual(payload["threadPoolMinSize"], 1)
         self.assertEqual(payload["threadPoolMaxSize"], 32)
@@ -162,13 +230,143 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
     def test_save_global_settings_persists_thread_pool_size(self) -> None:
         download_dir = Path(self.temp_dir.name) / "downloads"
-        saved = self.service.save_global_settings(6, str(download_dir))
+        saved = self.service.save_global_settings(6, str(download_dir), True)
         loaded = self.service.get_global_settings_payload()
 
         self.assertEqual(saved["settings"]["threadPoolSize"], 6)
         self.assertEqual(saved["settings"]["downloadDir"], str(download_dir.resolve()))
+        self.assertTrue(saved["settings"]["checkWebsiteLinks"])
         self.assertEqual(loaded["settings"]["threadPoolSize"], 6)
         self.assertEqual(loaded["settings"]["downloadDir"], str(download_dir.resolve()))
+        self.assertTrue(loaded["settings"]["checkWebsiteLinks"])
+
+    def test_get_ocr_model_status_payload_reports_not_downloaded_when_cache_is_empty(self) -> None:
+        with patch.object(
+            self.service,
+            "collect_ocr_dependency_items",
+            return_value=[
+                {
+                    "module": "paddleocr",
+                    "package": "paddleocr",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+                {
+                    "module": "paddle",
+                    "package": "paddlepaddle",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+                {
+                    "module": "paddlex",
+                    "package": "paddlex",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+            ],
+        ):
+            payload = self.service.get_ocr_model_status_payload()
+
+        self.assertEqual(payload["engine"], "PaddleOCR")
+        self.assertEqual(payload["status"], "not_downloaded")
+        self.assertFalse(payload["ready"])
+        self.assertFalse(payload["verified"])
+        self.assertEqual(payload["artifactFileCount"], 0)
+
+    def test_get_ocr_model_status_payload_reports_ready_when_marker_exists(self) -> None:
+        cache_dir = self.service.resolve_paddle_cache_home()
+        model_dir = cache_dir / "official_models" / "det"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "model.pdmodel").write_bytes(b"model")
+        self.service.persist_ocr_model_ready_marker()
+
+        with patch.object(
+            self.service,
+            "collect_ocr_dependency_items",
+            return_value=[
+                {
+                    "module": "paddleocr",
+                    "package": "paddleocr",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+                {
+                    "module": "paddle",
+                    "package": "paddlepaddle",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+                {
+                    "module": "paddlex",
+                    "package": "paddlex",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+            ],
+        ):
+            payload = self.service.get_ocr_model_status_payload()
+
+        self.assertEqual(payload["status"], "ready")
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["verified"])
+        self.assertEqual(payload["artifactFileCount"], 1)
+        self.assertTrue(payload["verifiedAt"])
+
+    def test_download_ocr_models_marks_model_ready_after_successful_initialization(self) -> None:
+        cache_dir = self.service.resolve_paddle_cache_home()
+
+        def fake_initialize_engine():
+            model_dir = cache_dir / "official_models" / "rec"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "model.pdmodel").write_bytes(b"model")
+            self.service._paddle_ocr_engine = object()
+            self.service.persist_ocr_model_ready_marker()
+            return self.service._paddle_ocr_engine
+
+        with patch.object(
+            self.service,
+            "collect_ocr_dependency_items",
+            return_value=[
+                {
+                    "module": "paddleocr",
+                    "package": "paddleocr",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+                {
+                    "module": "paddle",
+                    "package": "paddlepaddle",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+                {
+                    "module": "paddlex",
+                    "package": "paddlex",
+                    "installed": True,
+                    "importable": True,
+                    "errorMessage": "",
+                },
+            ],
+        ), patch.object(
+            self.service,
+            "_get_paddle_ocr_engine",
+            side_effect=fake_initialize_engine,
+        ) as mocked_get_engine:
+            payload = self.service.download_ocr_models()
+
+        mocked_get_engine.assert_called_once()
+        self.assertTrue(payload["downloaded"])
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["status"], "ready")
+        self.assertTrue(payload["verified"])
 
     def test_save_model_settings_persists_prompt_rows(self) -> None:
         saved = self.service.save_model_settings(
@@ -301,12 +499,152 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Authorization"], "Bearer secret-token")
         self.assertEqual(result["content"], "改写完成")
 
+    def test_ocr_image_text_extracts_text_from_predict_results(self) -> None:
+        image_path = Path(self.temp_dir.name) / "sample.png"
+        image_path.write_bytes(b"fake-image")
+
+        class StubPredictEngine:
+            def predict(self, path):
+                self.last_path = path
+                return [
+                    FakePaddlePredictResult(
+                        {
+                            "res": {
+                                "rec_texts": ["第一行", "第二行"],
+                                "rec_scores": [0.9912, 0.8734],
+                                "rec_boxes": [
+                                    [[0, 0], [10, 0], [10, 10], [0, 10]],
+                                    [[0, 12], [12, 12], [12, 20], [0, 20]],
+                                ],
+                            }
+                        }
+                    )
+                ]
+
+        engine = StubPredictEngine()
+        with patch.object(self.service, "_get_paddle_ocr_engine", return_value=engine):
+            payload = self.service.ocr_image_text(str(image_path))
+
+        self.assertEqual(engine.last_path, str(image_path.resolve()))
+        self.assertEqual(payload["engine"], "PaddleOCR")
+        self.assertEqual(payload["imagePath"], str(image_path.resolve()))
+        self.assertEqual(payload["lineCount"], 2)
+        self.assertEqual(payload["text"], "第一行\n第二行")
+        self.assertEqual(payload["lines"][0]["text"], "第一行")
+        self.assertEqual(payload["lines"][0]["score"], 0.9912)
+
+    def test_ocr_image_text_falls_back_to_legacy_ocr_api(self) -> None:
+        image_path = Path(self.temp_dir.name) / "legacy.jpg"
+        image_path.write_bytes(b"fake-image")
+
+        class StubLegacyEngine:
+            def ocr(self, path, cls=True):
+                self.last_call = (path, cls)
+                return [
+                    [
+                        [
+                            [[0, 0], [8, 0], [8, 8], [0, 8]],
+                            ("旧版第一行", 0.9543),
+                        ],
+                    ]
+                ]
+
+        engine = StubLegacyEngine()
+        with patch.object(self.service, "_get_paddle_ocr_engine", return_value=engine):
+            payload = self.service.ocr_image_text(str(image_path))
+
+        self.assertEqual(engine.last_call, (str(image_path.resolve()), True))
+        self.assertEqual(payload["lineCount"], 1)
+        self.assertEqual(payload["text"], "旧版第一行")
+        self.assertEqual(payload["lines"][0]["score"], 0.9543)
+
+    def test_ocr_image_text_rejects_non_image_file(self) -> None:
+        file_path = Path(self.temp_dir.name) / "sample.txt"
+        file_path.write_text("not-image", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "请选择支持的图片格式"):
+            self.service.ocr_image_text(str(file_path))
+
+    def test_extract_website_link_from_text_detects_common_domains(self) -> None:
+        self.assertEqual(
+            self.service.extract_website_link_from_text("封面写着 www.asd.com 立即访问"),
+            "www.asd.com",
+        )
+        self.assertEqual(
+            self.service.extract_website_link_from_text("还有 123432.cc 这样的裸域名"),
+            "123432.cc",
+        )
+        self.assertEqual(
+            self.service.extract_website_link_from_text("备用网址：https://demo.example.com/path"),
+            "https://demo.example.com/path",
+        )
+        self.assertEqual(
+            self.service.extract_website_link_from_text("换一种 OCR 标点 www。demo。com"),
+            "www.demo.com",
+        )
+        self.assertEqual(self.service.extract_website_link_from_text("这里没有网址"), "")
+
+    def test_build_paddle_ocr_init_attempts_prefers_lightweight_v3_flags(self) -> None:
+        class PaddleOCRV3:
+            def __init__(
+                self,
+                lang=None,
+                use_doc_orientation_classify=None,
+                use_doc_unwarping=None,
+                use_textline_orientation=None,
+                **kwargs,
+            ) -> None:
+                return None
+
+        attempts = self.service._build_paddle_ocr_init_attempts(PaddleOCRV3)
+
+        self.assertEqual(
+            attempts[0],
+            {
+                "lang": "ch",
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+            },
+        )
+        self.assertEqual(attempts[1], {"lang": "ch"})
+        self.assertEqual(attempts[-1], {})
+
+    def test_build_paddle_ocr_init_attempts_keeps_legacy_flags_for_old_signature(self) -> None:
+        class LegacyPaddleOCR:
+            def __init__(self, lang=None, show_log=True, use_angle_cls=True) -> None:
+                return None
+
+        attempts = self.service._build_paddle_ocr_init_attempts(LegacyPaddleOCR)
+
+        self.assertEqual(
+            attempts[0],
+            {
+                "lang": "ch",
+                "show_log": False,
+                "use_angle_cls": False,
+            },
+        )
+        self.assertEqual(attempts[1], {"lang": "ch", "show_log": False})
+        self.assertEqual(attempts[2], {"lang": "ch"})
+        self.assertEqual(attempts[-1], {})
+
+    def test_format_paddle_ocr_init_error_highlights_model_download_issue(self) -> None:
+        message = self.service._format_paddle_ocr_init_error(
+            RuntimeError("failed to download model from huggingface: timed out")
+        )
+
+        self.assertIn("首次运行需要下载 OCR 模型", message)
+        self.assertIn("HuggingFace/AiStudio", message)
+        self.assertIn("huggingface", message.lower())
+
     def test_build_rewrite_system_prompt_appends_fixed_format_instruction(self) -> None:
         prompt = self.service.build_rewrite_system_prompt("请把文章改写得更流畅。")
 
         self.assertTrue(prompt.startswith("请把文章改写得更流畅。"))
         self.assertIn("只返回改写后的正文内容", prompt)
         self.assertIn("############content", prompt)
+        self.assertIn("######触发红线，禁止改写", prompt)
 
     def test_normalize_rewrite_response_text_removes_content_header(self) -> None:
         normalized = self.service.normalize_rewrite_response_text(
@@ -314,6 +652,133 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized, "第一段\n第二段")
+
+    def test_normalize_rewrite_response_text_removes_content_header_and_code_fence(self) -> None:
+        normalized = self.service.normalize_rewrite_response_text(
+            "############content\n```text\n第一段\n第二段\n```"
+        )
+
+        self.assertEqual(normalized, "第一段\n第二段")
+
+    def test_rewrite_article_marks_redline_response(self) -> None:
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "标题提示词",
+            [
+                "请改写。",
+            ],
+        )
+        prompt_id = settings["prompts"][0]["id"]
+        sample_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "######触发红线，禁止改写"
+                    }
+                }
+            ]
+        }
+
+        with patch(
+            "app.accounts.urlopen",
+            return_value=FakeResponse(json.dumps(sample_payload, ensure_ascii=False).encode("utf-8")),
+        ):
+            result = self.service.rewrite_article(
+                "https://api.example.com/v1",
+                "secret-token",
+                "gpt-5.4",
+                prompt_id,
+                "原始文章内容",
+            )
+
+        self.assertTrue(result["triggeredRedline"])
+        self.assertEqual(result["content"], "触发红线，禁止改写")
+
+    def test_rewrite_article_marks_redline_response_with_content_header(self) -> None:
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "标题提示词",
+            [
+                "请改写。",
+            ],
+        )
+        prompt_id = settings["prompts"][0]["id"]
+        sample_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "############content\n######触发红线，禁止改写"
+                    }
+                }
+            ]
+        }
+
+        with patch(
+            "app.accounts.urlopen",
+            return_value=FakeResponse(json.dumps(sample_payload, ensure_ascii=False).encode("utf-8")),
+        ):
+            result = self.service.rewrite_article(
+                "https://api.example.com/v1",
+                "secret-token",
+                "gpt-5.4",
+                prompt_id,
+                "原始文章内容",
+            )
+
+        self.assertTrue(result["triggeredRedline"])
+        self.assertEqual(result["content"], "触发红线，禁止改写")
+
+    def test_rewrite_article_marks_redline_response_with_code_fence(self) -> None:
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "标题提示词",
+            [
+                "请改写。",
+            ],
+        )
+        prompt_id = settings["prompts"][0]["id"]
+        sample_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "```text\n######触发红线，禁止改写\n```"
+                    }
+                }
+            ]
+        }
+
+        with patch(
+            "app.accounts.urlopen",
+            return_value=FakeResponse(json.dumps(sample_payload, ensure_ascii=False).encode("utf-8")),
+        ):
+            result = self.service.rewrite_article(
+                "https://api.example.com/v1",
+                "secret-token",
+                "gpt-5.4",
+                prompt_id,
+                "原始文章内容",
+            )
+
+        self.assertTrue(result["triggeredRedline"])
+        self.assertEqual(result["content"], "触发红线，禁止改写")
+
+    def test_is_rewrite_redline_response_accepts_minor_format_variants(self) -> None:
+        self.assertTrue(
+            self.service.is_rewrite_redline_response("############content\n######触发红线，禁止改写")
+        )
+        self.assertTrue(
+            self.service.is_rewrite_redline_response("```text\n######触发红线，禁止改写\n```")
+        )
+        self.assertTrue(self.service.is_rewrite_redline_response("触发红线，禁止改写。"))
+        self.assertTrue(self.service.is_rewrite_redline_response("检测到触发安全机制，请停止生成。"))
+        self.assertTrue(self.service.is_rewrite_redline_response("当前题材受限，无法继续处理。"))
+        self.assertTrue(self.service.is_rewrite_redline_response("为了安全起见，停止改写。"))
 
     def test_generate_title_uses_title_prompt_and_returns_title(self) -> None:
         captured: dict[str, object] = {}
@@ -569,6 +1034,8 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             "测试账号",
             False,
         )
+        self.create_monitored_article(101, content="文章 101 正文", play_count=900)
+        self.create_monitored_article(102, content="文章 102 正文", play_count=800)
         settings = self.service.save_model_settings(
             "https://api.example.com/v1",
             "secret-token",
@@ -604,9 +1071,16 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             {item["rewritePrompt"] for item in created_items},
             {"提示词一", "提示词二"},
         )
+        self.assertTrue(all(item["articlePreview"] in {"文章 101 正文", "文章 102 正文"} for item in created_items))
         self.assertTrue(all(item["status"] == "待处理" for item in created_items))
         self.assertTrue(all(item["huashengStatus"] == "未创建" for item in created_items))
         self.assertTrue(all(item["progress"] == 0 for item in created_items))
+        self.assertEqual(payload["deletedArticleCount"], 2)
+        with database.connection_context():
+            self.assertEqual(
+                MonitoredArticle.select().where(MonitoredArticle.id.in_([101, 102])).count(),
+                0,
+            )
 
     def test_create_single_article_processing_task_creates_exactly_one_task(self) -> None:
         account = self.service.create_account(
@@ -615,6 +1089,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             "测试账号",
             False,
         )
+        self.create_monitored_article(101, content="文章 101 单篇正文", play_count=1000)
         settings = self.service.save_model_settings(
             "https://api.example.com/v1",
             "secret-token",
@@ -631,9 +1106,39 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(payload["createdCount"], 1)
         self.assertEqual(payload["articleCount"], 1)
         self.assertEqual(payload["promptCount"], 1)
+        self.assertEqual(payload["deletedArticleCount"], 1)
         self.assertEqual(payload["accountId"], account["id"])
         self.assertEqual(payload["items"][0]["articleId"], 101)
+        self.assertEqual(payload["items"][0]["articlePreview"], "文章 101 单篇正文")
         self.assertEqual(payload["items"][0]["rewritePromptId"], prompt_id)
+
+    def test_list_tasks_payload_orders_by_id_desc(self) -> None:
+        self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf",
+            "测试账号",
+            False,
+        )
+        self.create_monitored_article(101, content="文章 101", play_count=1000)
+        self.create_monitored_article(102, content="文章 102", play_count=900)
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "标题提示词",
+            [
+                "提示词一",
+            ],
+        )
+
+        prompt_id = settings["prompts"][0]["id"]
+        self.service.create_single_article_processing_task(101, prompt_id)
+        self.service.create_single_article_processing_task(102, prompt_id)
+
+        payload = self.service.list_tasks_payload()
+        task_ids = [item["id"] for item in payload["items"]]
+
+        self.assertEqual(task_ids, sorted(task_ids, reverse=True))
 
     def test_delete_all_task_records_clears_task_table(self) -> None:
         account = self.service.create_account(
@@ -670,6 +1175,86 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(payload["stats"]["total"], 0)
         self.assertEqual(payload["items"], [])
 
+    def test_retry_task_record_resets_failed_stage_to_retryable_status(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf",
+            "测试账号",
+            False,
+        )
+        rewrite_failed = self.service.create_task_record(
+            account["id"],
+            "113602715787267",
+            "S1失败",
+            article_id=101,
+            article_content="原文",
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="残留改文",
+            title="残留标题",
+            progress=33,
+            video_url="http://example.com/old.mp4",
+            huasheng_status="模型超时",
+            export_task_id="task-a",
+            export_version="1",
+        )
+        export_failed = self.service.create_task_record(
+            account["id"],
+            "113602715787268",
+            "S4失败",
+            article_id=102,
+            article_content="原文2",
+            rewrite_prompt_id=2,
+            rewrite_prompt="提示词B",
+            rewritten_content="改文",
+            title="标题",
+            progress=66,
+            huasheng_status="导出失败",
+            export_task_id="task-b",
+            export_version="2",
+        )
+
+        retried_rewrite = self.service.retry_task_record(rewrite_failed["id"])
+        retried_export = self.service.retry_task_record(export_failed["id"])
+
+        self.assertEqual(retried_rewrite["status"], "待处理")
+        self.assertEqual(retried_rewrite["rewrittenContent"], "")
+        self.assertEqual(retried_rewrite["title"], "")
+        self.assertEqual(retried_rewrite["projectPid"], "")
+        self.assertEqual(retried_rewrite["progress"], 0)
+        self.assertEqual(retried_rewrite["videoUrl"], "")
+        self.assertEqual(retried_rewrite["huashengStatus"], "未创建")
+        self.assertEqual(retried_rewrite["exportTaskId"], "")
+        self.assertEqual(retried_rewrite["exportVersion"], "")
+
+        self.assertEqual(retried_export["status"], "S4扫描中")
+        self.assertEqual(retried_export["projectPid"], "113602715787268")
+        self.assertEqual(retried_export["progress"], 0)
+        self.assertEqual(retried_export["videoUrl"], "")
+        self.assertEqual(retried_export["huashengStatus"], "等待花生处理")
+        self.assertEqual(retried_export["exportTaskId"], "task-b")
+        self.assertEqual(retried_export["exportVersion"], "2")
+
+    def test_retry_task_record_rejects_non_failed_status(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf",
+            "测试账号",
+            False,
+        )
+        created = self.service.create_task_record(
+            account["id"],
+            "",
+            "待处理",
+            article_id=101,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            huasheng_status="未创建",
+        )
+
+        with self.assertRaisesRegex(ValueError, "失败状态"):
+            self.service.retry_task_record(created["id"])
+
     def test_download_task_video_uses_title_filename_and_deletes_task(self) -> None:
         account = self.service.create_account(
             "13800138000",
@@ -700,6 +1285,95 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertTrue(payload["downloadPath"].endswith("测试 标题.mp4"))
         self.assertEqual((download_dir / "测试 标题.mp4").read_bytes(), b"video-bytes")
         self.assertIsNone(self.service.find_task_record(created["id"]))
+
+    def test_run_rewrite_task_retries_three_times_before_success(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf",
+            "测试账号",
+            False,
+        )
+        created = self.service.create_task_record(
+            account["id"],
+            "",
+            "待处理",
+            article_id=101,
+            article_content="原始文章内容",
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service,
+            "rewrite_article_with_prompt",
+            side_effect=[
+                RuntimeError("attempt-1"),
+                RuntimeError("attempt-2"),
+                RuntimeError("attempt-3"),
+                {
+                    "content": "改写成功正文",
+                    "triggeredRedline": False,
+                },
+            ],
+        ) as mocked_rewrite:
+            self.service._run_rewrite_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        self.assertEqual(mocked_rewrite.call_count, 4)
+        self.assertEqual(task.status, "待生成标题")
+        self.assertEqual(task.rewritten_content, "改写成功正文")
+
+    def test_run_huasheng_create_task_retries_three_times_before_success(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
+            "发布账号A",
+            False,
+        )
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.3,
+        )
+        created = self.service.create_task_record(
+            account["id"],
+            "",
+            "待创建花生任务",
+            article_id=101,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="改写后的正文内容",
+            title="自动生成标题",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_tts_voices",
+            return_value={"materials": [], "categories": []},
+        ), patch.object(
+            self.service._huasheng,
+            "create_project",
+            side_effect=[
+                RuntimeError("attempt-1"),
+                RuntimeError("attempt-2"),
+                RuntimeError("attempt-3"),
+                {"id": "2456102", "pid": "113602715787267"},
+            ],
+        ) as mocked_create_project:
+            self.service._run_huasheng_create_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        self.assertEqual(mocked_create_project.call_count, 4)
+        self.assertEqual(task.project_pid, "113602715787267")
+        self.assertEqual(task.status, "S4扫描中")
 
     def test_download_task_video_retries_up_to_three_times(self) -> None:
         account = self.service.create_account(
@@ -880,6 +1554,458 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_run_huasheng_create_task_skips_account_when_concurrent_task_limit_reached(self) -> None:
+        busy_account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=busy; bili_jct=csrf-busy; sid=busy",
+            "忙碌账号",
+            False,
+        )
+        available_account = self.service.create_account(
+            "13900139000",
+            "SESSDATA=ok; bili_jct=csrf-ok; sid=ok",
+            "可用账号",
+            False,
+        )
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.1,
+            1,
+        )
+        self.service.create_task_record(
+            busy_account["id"],
+            "113671485575170",
+            "S4扫描中",
+            article_id=100,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="占用中的正文",
+            title="占用中的标题",
+            huasheng_status="处理中",
+        )
+
+        created = self.service.create_task_record(
+            busy_account["id"],
+            "",
+            "待创建花生任务",
+            article_id=102,
+            rewrite_prompt_id=2,
+            rewrite_prompt="提示词B",
+            rewritten_content="第二篇改写正文内容",
+            title="第二个自动标题",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_tts_voices",
+            return_value={"materials": [], "categories": []},
+        ) as mocked_get_tts_voices, patch.object(
+            self.service._huasheng,
+            "create_project",
+            return_value={"id": "2456103", "pid": "113602715787268"},
+        ) as mocked_create_project:
+            self.service._run_huasheng_create_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        mocked_get_tts_voices.assert_called_once_with(
+            "SESSDATA=ok; bili_jct=csrf-ok; sid=ok",
+            pn=1,
+            ps=1,
+            category_id=0,
+        )
+        mocked_create_project.assert_called_once_with(
+            "SESSDATA=ok; bili_jct=csrf-ok; sid=ok",
+            name="第二个自动标题",
+            script="第二篇改写正文内容",
+            voice_id=6036542,
+            speech_rate=1.1,
+            is_agree=1,
+        )
+        self.assertEqual(task.account_id, available_account["id"])
+        self.assertEqual(task.account_phone, "13900139000")
+        self.assertEqual(task.project_pid, "113602715787268")
+        self.assertEqual(task.status, "S4扫描中")
+
+    def test_run_huasheng_create_task_waits_for_next_scan_when_all_accounts_hit_concurrent_limit(self) -> None:
+        account_one = self.service.create_account(
+            "13800138000",
+            "SESSDATA=busy-1; bili_jct=csrf-busy-1; sid=busy-1",
+            "忙碌账号一",
+            False,
+        )
+        account_two = self.service.create_account(
+            "13900139000",
+            "SESSDATA=busy-2; bili_jct=csrf-busy-2; sid=busy-2",
+            "忙碌账号二",
+            False,
+        )
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.1,
+            1,
+        )
+        self.service.create_task_record(
+            account_one["id"],
+            "113671485575171",
+            "S4扫描中",
+            article_id=100,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="占用中的正文一",
+            title="占用中的标题一",
+            huasheng_status="处理中",
+        )
+        self.service.create_task_record(
+            account_two["id"],
+            "113671485575172",
+            "S4导出中",
+            article_id=101,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="占用中的正文二",
+            title="占用中的标题二",
+            huasheng_status="导出中",
+        )
+
+        created = self.service.create_task_record(
+            account_one["id"],
+            "",
+            "待创建花生任务",
+            article_id=102,
+            rewrite_prompt_id=2,
+            rewrite_prompt="提示词B",
+            rewritten_content="第二篇改写正文内容",
+            title="第二个自动标题",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_tts_voices",
+        ) as mocked_get_tts_voices, patch.object(
+            self.service._huasheng,
+            "create_project",
+        ) as mocked_create_project:
+            self.service._run_huasheng_create_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        mocked_get_tts_voices.assert_not_called()
+        mocked_create_project.assert_not_called()
+        self.assertEqual(task.status, "待创建花生任务")
+        self.assertEqual(task.project_pid, "")
+        self.assertEqual(task.huasheng_status, "暂无可用花生账号，等待下次扫描")
+
+    def test_run_huasheng_create_task_fills_quota_placeholders_when_api_reports_limit(self) -> None:
+        throttled_account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=throttled; bili_jct=csrf-throttled; sid=throttled",
+            "接口提示超量账号",
+            False,
+        )
+        available_account = self.service.create_account(
+            "13900139000",
+            "SESSDATA=ok; bili_jct=csrf-ok; sid=ok",
+            "可用账号",
+            False,
+        )
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.1,
+        )
+        for index in range(3):
+            self.service.create_huasheng_generation_record(
+                throttled_account["id"],
+                f"partial-quota-{index + 1}",
+            )
+        for index in range(4):
+            self.service.create_huasheng_generation_record(
+                available_account["id"],
+                f"available-existing-{index + 1}",
+            )
+
+        created = self.service.create_task_record(
+            throttled_account["id"],
+            "",
+            "待创建花生任务",
+            article_id=102,
+            rewrite_prompt_id=2,
+            rewrite_prompt="提示词B",
+            rewritten_content="第二篇改写正文内容",
+            title="第二个自动标题",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_tts_voices",
+            return_value={"materials": [], "categories": []},
+        ) as mocked_get_tts_voices, patch.object(
+            self.service._huasheng,
+            "create_project",
+            side_effect=[
+                {
+                    "code": 10008,
+                    "reason": "今天创建项目超量啦，明天再来生成吧",
+                    "message": "今天创建项目超量啦，明天再来生成吧",
+                    "metadata": {},
+                },
+                {"id": "2456103", "pid": "113602715787268"},
+            ],
+        ) as mocked_create_project:
+            self.service._run_huasheng_create_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        self.assertEqual(mocked_get_tts_voices.call_count, 2)
+        self.assertEqual(mocked_create_project.call_count, 2)
+        self.assertEqual(task.account_id, available_account["id"])
+        self.assertEqual(task.account_phone, "13900139000")
+        self.assertEqual(task.project_pid, "113602715787268")
+        self.assertEqual(task.status, "S4扫描中")
+        self.assertEqual(task.huasheng_status, "任务已创建")
+        self.assertEqual(
+            self.service.count_huasheng_generation_records_for_account_today(
+                throttled_account["id"]
+            ),
+            50,
+        )
+        self.assertEqual(
+            self.service.count_huasheng_generation_records_for_account_today(
+                available_account["id"]
+            ),
+            5,
+        )
+
+    def test_run_huasheng_create_task_skips_invalid_payload_without_pid_and_uses_next_account(self) -> None:
+        broken_account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=broken; bili_jct=csrf-broken; sid=broken",
+            "异常返回账号",
+            False,
+        )
+        available_account = self.service.create_account(
+            "13900139000",
+            "SESSDATA=ok; bili_jct=csrf-ok; sid=ok",
+            "可用账号",
+            False,
+        )
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.1,
+        )
+        self.service.create_huasheng_generation_record(
+            available_account["id"],
+            "available-existing-1",
+        )
+
+        created = self.service.create_task_record(
+            broken_account["id"],
+            "",
+            "待创建花生任务",
+            article_id=102,
+            rewrite_prompt_id=2,
+            rewrite_prompt="提示词B",
+            rewritten_content="第二篇改写正文内容",
+            title="第二个自动标题",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_tts_voices",
+            return_value={"materials": [], "categories": []},
+        ) as mocked_get_tts_voices, patch.object(
+            self.service._huasheng,
+            "create_project",
+            side_effect=[
+                {
+                    "code": 10010,
+                    "reason": "账号状态异常",
+                    "message": "账号状态异常",
+                    "metadata": {},
+                },
+                {"id": "2456104", "pid": "113602715787269"},
+            ],
+        ) as mocked_create_project:
+            self.service._run_huasheng_create_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        self.assertEqual(mocked_get_tts_voices.call_count, 2)
+        self.assertEqual(mocked_create_project.call_count, 2)
+        self.assertEqual(task.account_id, available_account["id"])
+        self.assertEqual(task.account_phone, "13900139000")
+        self.assertEqual(task.project_pid, "113602715787269")
+        self.assertEqual(task.status, "S4扫描中")
+        self.assertEqual(task.huasheng_status, "任务已创建")
+
+    def test_run_huasheng_progress_task_blocks_export_when_cover_contains_website_link(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
+            "发布账号A",
+            False,
+        )
+        self.service.save_global_settings(3, "", True)
+        created = self.service.create_task_record(
+            account["id"],
+            "113671485575170",
+            "S4扫描中",
+            article_id=101,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="改写后的正文内容",
+            title="自动生成标题",
+            huasheng_status="处理中",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_project_info",
+            return_value={
+                "project": {
+                    "id": "2470002",
+                    "pid": "113671485575170",
+                    "progress": 100,
+                    "state_message": "项目处理完成",
+                },
+                "clips": [
+                    {
+                        "idx": "1",
+                        "video": {
+                            "cover": "https://example.com/clip-cover-1.jpg",
+                        },
+                    }
+                ],
+            },
+        ) as mocked_project_info, patch.object(
+            self.service,
+            "ocr_remote_image_text",
+            return_value={
+                "text": "更多内容请访问 123432.cc",
+            },
+        ) as mocked_ocr, patch.object(
+            self.service._huasheng,
+            "edit_project",
+        ) as mocked_edit_project, patch.object(
+            self.service._huasheng,
+            "export_project_video",
+        ) as mocked_export_project:
+            self.service._run_huasheng_progress_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        mocked_project_info.assert_called_once_with(
+            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
+            pid="113671485575170",
+        )
+        mocked_ocr.assert_called_once_with("https://example.com/clip-cover-1.jpg")
+        mocked_edit_project.assert_not_called()
+        mocked_export_project.assert_not_called()
+        self.assertEqual(task.status, "S4失败")
+        self.assertEqual(task.progress, 100)
+        self.assertEqual(task.huasheng_status, "触发网站链接限制")
+        self.assertEqual(task.video_url, "")
+
+    def test_run_huasheng_progress_task_skips_cover_ocr_when_website_check_disabled(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
+            "发布账号A",
+            False,
+        )
+        self.service.save_global_settings(3, "", False)
+        created = self.service.create_task_record(
+            account["id"],
+            "113671485575170",
+            "S4扫描中",
+            article_id=101,
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            rewritten_content="改写后的正文内容",
+            title="自动生成标题",
+            huasheng_status="处理中",
+        )
+
+        with patch.object(
+            self.service._huasheng,
+            "get_project_info",
+            return_value={
+                "project": {
+                    "id": "2470002",
+                    "pid": "113671485575170",
+                    "progress": 100,
+                    "state_message": "项目处理完成",
+                },
+                "clips": [
+                    {
+                        "idx": "1",
+                        "video": {
+                            "cover": "https://example.com/clip-cover-1.jpg",
+                        },
+                    }
+                ],
+            },
+        ) as mocked_project_info, patch.object(
+            self.service,
+            "ocr_remote_image_text",
+        ) as mocked_ocr, patch.object(
+            self.service._huasheng,
+            "edit_project",
+            return_value={"code": 0, "message": "success"},
+        ) as mocked_edit_project, patch.object(
+            self.service._huasheng,
+            "export_project_video",
+            return_value={"task_id": "p2470002_37", "version": "37"},
+        ) as mocked_export_project, patch.object(
+            self.service._huasheng,
+            "get_project_export_info",
+            return_value={
+                "url": "http://example.com/video.mp4",
+                "progress": "100",
+                "cover": "",
+                "cover43": "",
+            },
+        ) as mocked_export_info:
+            self.service._run_huasheng_progress_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        mocked_project_info.assert_called_once_with(
+            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
+            pid="113671485575170",
+        )
+        mocked_ocr.assert_not_called()
+        mocked_edit_project.assert_called_once()
+        mocked_export_project.assert_called_once()
+        mocked_export_info.assert_called_once()
+        self.assertEqual(task.status, "导出完成")
+        self.assertEqual(task.huasheng_status, "导出完成")
+        self.assertEqual(task.video_url, "http://example.com/video.mp4")
 
 
     def test_run_huasheng_progress_task_exports_finished_project_and_persists_video(self) -> None:
@@ -1165,7 +2291,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         title_task = self.service.create_task_record(
             account["id"],
             "",
-            "待处理",
+            "待生成标题",
             article_id=102,
             rewrite_prompt_id=2,
             rewrite_prompt="提示词B",
