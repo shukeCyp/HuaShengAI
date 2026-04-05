@@ -10,6 +10,12 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 project_root = Path(SPECPATH).resolve()
 app_dist_name = os.environ.get("HUASHENGAI_DIST_NAME", "荷塘AI花生工具").strip() or "荷塘AI花生工具"
 playwright_browser_dir = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+show_console = os.environ.get("HUASHENGAI_CONSOLE", "1" if sys.platform.startswith("win") else "0").strip().lower() not in {
+    "",
+    "0",
+    "false",
+    "no",
+}
 
 datas = collect_data_files("webview")
 datas += collect_data_files("playwright")
@@ -65,7 +71,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,
+    console=show_console,
 )
 
 coll = COLLECT(
