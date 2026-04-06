@@ -13,6 +13,7 @@ const props = defineProps({
 const emit = defineEmits(['status', 'database-path', 'tasks-created'])
 
 const PAGE_SIZE = 20
+const DEFAULT_TOP_PROCESS_COUNT = 20
 
 const loading = ref(false)
 const deleting = ref(false)
@@ -29,6 +30,8 @@ const promptOptions = ref([])
 const selectedPromptIds = ref([])
 const selectedSinglePromptId = ref(0)
 const selectedArticle = ref(null)
+const bulkMode = ref('all')
+const bulkLimitInput = ref(DEFAULT_TOP_PROCESS_COUNT)
 const filters = reactive({
   keyword: ''
 })
@@ -41,9 +44,37 @@ const paginationSummary = computed(() => {
   return `共 ${total.value} 条，第 ${page.value} / ${totalPages.value} 页`
 })
 const selectedPromptCount = computed(() => selectedPromptIds.value.length)
-const queuedTaskCount = computed(() => total.value * selectedPromptCount.value)
+const normalizedBulkLimit = computed(() => {
+  const parsed = Math.floor(Number(bulkLimitInput.value) || 0)
+  return parsed > 0 ? parsed : 0
+})
+const bulkTargetArticleCount = computed(() => {
+  if (bulkMode.value === 'top') {
+    return Math.min(total.value, normalizedBulkLimit.value)
+  }
+  return total.value
+})
+const queuedTaskCount = computed(() => bulkTargetArticleCount.value * selectedPromptCount.value)
 const hasSelectedPrompts = computed(() => selectedPromptIds.value.length > 0)
 const hasSelectedSinglePrompt = computed(() => Number(selectedSinglePromptId.value) > 0)
+const canSubmitBulk = computed(() => {
+  if (!hasSelectedPrompts.value) {
+    return false
+  }
+  if (bulkMode.value === 'top') {
+    return bulkTargetArticleCount.value > 0
+  }
+  return total.value > 0
+})
+const bulkDialogTitle = computed(() => {
+  return bulkMode.value === 'top' ? '批量处理' : '全量处理'
+})
+const bulkDialogDescription = computed(() => {
+  if (bulkMode.value === 'top') {
+    return '输入要处理的文章数量。系统会按播放量从高到低取前几篇文章，并按所选提示词批量创建任务。'
+  }
+  return '当前将处理筛选结果中的全部文章。至少选择一个提示词，可多选；每篇文章会按每个提示词各创建一个任务。'
+})
 const selectedArticlePreview = computed(() => {
   return selectedArticle.value ? getArticlePreview(selectedArticle.value) : '未选择文章'
 })
@@ -112,6 +143,8 @@ function getPromptPreview(value) {
 
 function closeBulkDialog() {
   bulkDialogOpen.value = false
+  bulkMode.value = 'all'
+  bulkLimitInput.value = DEFAULT_TOP_PROCESS_COUNT
   selectedPromptIds.value = []
 }
 
@@ -163,7 +196,7 @@ async function loadPromptOptions() {
   }
 }
 
-async function openBulkDialog() {
+async function openBulkDialog(mode = 'all') {
   if (!props.desktopReady) {
     updateStatus('当前不在 PyWebView 环境内')
     return
@@ -173,6 +206,11 @@ async function openBulkDialog() {
     return
   }
 
+  bulkMode.value = mode === 'top' ? 'top' : 'all'
+  bulkLimitInput.value = Math.min(
+    Math.max(1, total.value || DEFAULT_TOP_PROCESS_COUNT),
+    DEFAULT_TOP_PROCESS_COUNT
+  )
   bulkDialogOpen.value = true
   selectedPromptIds.value = []
   await loadPromptOptions()
@@ -203,21 +241,32 @@ async function submitBulkTasks() {
     updateStatus('请至少选择一个改写提示词')
     return
   }
+  if (bulkMode.value === 'top' && bulkTargetArticleCount.value <= 0) {
+    updateStatus('请输入要处理的文章数量')
+    return
+  }
 
   bulkSubmitting.value = true
   try {
+    const requestFilters = {
+      keyword: filters.keyword.trim()
+    }
+    if (bulkMode.value === 'top') {
+      requestFilters.sortBy = 'playCountDesc'
+      requestFilters.limit = bulkTargetArticleCount.value
+    }
     const payload = await callDesktop(
       'create_article_processing_tasks',
-      {
-        keyword: filters.keyword.trim()
-      },
+      requestFilters,
       selectedPromptIds.value
     )
     updateDatabasePath(payload?.databasePath)
     notifyTasksCreated(payload)
     closeBulkDialog()
+    page.value = 1
+    await loadArticles('文章列表已刷新', { silent: true })
     updateStatus(
-      `已创建 ${Number(payload?.createdCount || 0)} 个任务，覆盖 ${Number(payload?.articleCount || 0)} 篇文章，使用账号 ID ${payload?.accountId || '--'}`
+      `已创建 ${Number(payload?.createdCount || 0)} 个任务，覆盖 ${Number(payload?.articleCount || 0)} 篇文章，已删除 ${Number(payload?.deletedArticleCount || 0)} 篇源文章，使用账号 ID ${payload?.accountId || '--'}`
     )
   } catch (error) {
     updateStatus(`创建任务失败: ${error instanceof Error ? error.message : String(error)}`)
@@ -249,8 +298,10 @@ async function submitSingleTask() {
     )
     updateDatabasePath(payload?.databasePath)
     notifyTasksCreated(payload)
+    page.value = 1
+    await loadArticles('文章列表已刷新', { silent: true })
     updateStatus(
-      `已为文章 #${selectedArticle.value.id} 创建 ${Number(payload?.createdCount || 0)} 个任务，使用账号 ID ${payload?.accountId || '--'}`
+      `已为文章 #${selectedArticle.value.id} 创建 ${Number(payload?.createdCount || 0)} 个任务，并删除源文章，使用账号 ID ${payload?.accountId || '--'}`
     )
     closeSingleDialog()
   } catch (error) {
@@ -260,7 +311,7 @@ async function submitSingleTask() {
   }
 }
 
-async function loadArticles(message = '文章列表已加载') {
+async function loadArticles(message = '文章列表已加载', { silent = false } = {}) {
   if (!props.desktopReady) {
     items.value = []
     total.value = 0
@@ -282,7 +333,9 @@ async function loadArticles(message = '文章列表已加载') {
     total.value = Number(payload.total || 0)
     totalPages.value = Math.max(1, Number(payload.totalPages || 1))
     updateDatabasePath(payload.databasePath)
-    updateStatus(`${message}，当前共 ${total.value} 条`)
+    if (!silent) {
+      updateStatus(`${message}，当前共 ${total.value} 条`)
+    }
   } catch (error) {
     updateStatus(`加载文章列表失败: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
@@ -384,7 +437,15 @@ watch(
           type="button"
           class="toolbar-button primary"
           :disabled="loading || deleting || !desktopReady || !total"
-          @click="openBulkDialog"
+          @click="openBulkDialog('top')"
+        >
+          批量处理
+        </button>
+        <button
+          type="button"
+          class="toolbar-button primary"
+          :disabled="loading || deleting || !desktopReady || !total"
+          @click="openBulkDialog('all')"
         >
           全量处理
         </button>
@@ -474,9 +535,9 @@ watch(
         <div class="article-bulk-dialog__head">
           <div>
             <p class="panel-kicker">文章处理</p>
-            <h3 id="article-bulk-dialog-title">全量处理</h3>
+            <h3 id="article-bulk-dialog-title">{{ bulkDialogTitle }}</h3>
             <p class="article-bulk-dialog__description">
-              当前将处理 {{ total }} 篇文章。至少选择一个提示词，可多选；每篇文章会按每个提示词各创建一个任务。
+              {{ bulkDialogDescription }}
             </p>
           </div>
           <button
@@ -491,8 +552,16 @@ watch(
         <div class="article-bulk-summary">
           <div class="article-bulk-summary__card">
             <span>文章数量</span>
-            <strong>{{ total }}</strong>
-            <small>{{ filters.keyword ? `关键词：${filters.keyword}` : '当前为全部文章' }}</small>
+            <strong>{{ bulkTargetArticleCount }}</strong>
+            <small>
+              {{
+                bulkMode === 'top'
+                  ? `按播放量排序，最多处理前 ${normalizedBulkLimit || 0} 篇`
+                  : filters.keyword
+                    ? `关键词：${filters.keyword}`
+                    : '当前为全部文章'
+              }}
+            </small>
           </div>
           <div class="article-bulk-summary__card">
             <span>提示词数量</span>
@@ -505,6 +574,23 @@ watch(
             <small>计算方式：文章数 × 提示词数</small>
           </div>
         </div>
+
+        <section v-if="bulkMode === 'top'" class="article-bulk-dialog__section">
+          <div class="settings-block-head">
+            <strong>处理数量</strong>
+            <small>系统会按照播放量从高到低选取文章</small>
+          </div>
+          <label class="form-field">
+            <span>处理多少个文章</span>
+            <input
+              v-model.number="bulkLimitInput"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="请输入要处理的文章数量"
+            />
+          </label>
+        </section>
 
         <section class="article-bulk-dialog__section">
           <div class="settings-block-head">
@@ -546,7 +632,7 @@ watch(
           <button
             type="button"
             class="toolbar-button primary"
-            :disabled="promptLoading || bulkSubmitting || !hasSelectedPrompts"
+            :disabled="promptLoading || bulkSubmitting || !canSubmitBulk"
             @click="submitBulkTasks"
           >
             {{ bulkSubmitting ? '创建中...' : `确定创建 ${queuedTaskCount} 个任务` }}

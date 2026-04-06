@@ -240,6 +240,22 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(loaded["settings"]["downloadDir"], str(download_dir.resolve()))
         self.assertTrue(loaded["settings"]["checkWebsiteLinks"])
 
+    def test_get_log_status_payload_reports_log_directory_file_count_and_size(self) -> None:
+        log_dir = self.service.resolve_log_directory_path()
+        first_log = log_dir / "huashengai-2026-04-05.log"
+        second_log = log_dir / "huashengai-2026-04-06.log"
+        first_log.write_text("hello", encoding="utf-8")
+        second_log.write_text("world!!!", encoding="utf-8")
+
+        payload = self.service.get_log_status_payload()
+
+        self.assertEqual(payload["logDir"], str(log_dir))
+        self.assertEqual(payload["fileCount"], 2)
+        self.assertEqual(payload["totalSizeBytes"], 13)
+        self.assertEqual(len(payload["files"]), 2)
+        self.assertTrue(payload["currentFileName"].startswith("huashengai-"))
+        self.assertIn("databasePath", payload)
+
     def test_get_ocr_model_status_payload_reports_not_downloaded_when_cache_is_empty(self) -> None:
         with patch.object(
             self.service,
@@ -367,6 +383,28 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertTrue(payload["ready"])
         self.assertEqual(payload["status"], "ready")
         self.assertTrue(payload["verified"])
+
+    def test_inspect_ocr_dependency_item_marks_module_not_found_as_not_installed(self) -> None:
+        with patch(
+            "app.accounts.importlib.import_module",
+            side_effect=ModuleNotFoundError("No module named 'paddlex'", name="paddlex"),
+        ):
+            item = self.service.inspect_ocr_dependency_item("paddlex", "paddlex")
+
+        self.assertFalse(item["installed"])
+        self.assertFalse(item["importable"])
+        self.assertEqual(item["errorMessage"], "未找到模块: paddlex")
+
+    def test_inspect_ocr_dependency_item_marks_missing_nested_dependency_as_installed_but_unimportable(self) -> None:
+        with patch(
+            "app.accounts.importlib.import_module",
+            side_effect=ModuleNotFoundError("No module named 'yaml'", name="yaml"),
+        ):
+            item = self.service.inspect_ocr_dependency_item("paddleocr", "paddleocr")
+
+        self.assertTrue(item["installed"])
+        self.assertFalse(item["importable"])
+        self.assertEqual(item["errorMessage"], "缺少依赖模块: yaml")
 
     def test_save_model_settings_persists_prompt_rows(self) -> None:
         saved = self.service.save_model_settings(

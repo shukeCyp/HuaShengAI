@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -202,6 +204,29 @@ class DesktopBridge:
             return str(result[0] or "")
         return str(result or "")
 
+    def open_directory_in_file_manager(self, directory: str) -> str:
+        resolved_directory = Path(str(directory or "")).expanduser().resolve()
+        resolved_directory.mkdir(parents=True, exist_ok=True)
+
+        if sys.platform == "darwin":
+            command = ["open", str(resolved_directory)]
+        elif sys.platform.startswith("win"):
+            command = ["explorer", str(resolved_directory)]
+        else:
+            command = ["xdg-open", str(resolved_directory)]
+
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"打开文件夹失败: {exc}") from exc
+
+        return str(resolved_directory)
+
     def publish_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         event = {
             "id": self._next_event_id(),
@@ -389,6 +414,19 @@ class AppApi:
             None if download_dir is None else str(download_dir),
             check_website_links,
         )
+
+    def get_log_status(self) -> dict[str, Any]:
+        logger.info("AppApi.get_log_status called")
+        return self._account_service.get_log_status_payload()
+
+    def open_logs_directory(self) -> dict[str, Any]:
+        log_dir = self._account_service.resolve_log_directory_path()
+        logger.info("AppApi.open_logs_directory called log_dir=%s", log_dir)
+        opened_path = self._bridge.open_directory_in_file_manager(str(log_dir))
+        return {
+            "openedPath": opened_path,
+            "databasePath": str(self._account_service.db_path),
+        }
 
     def select_download_directory(self, current_directory: str = "") -> dict[str, Any]:
         logger.info(

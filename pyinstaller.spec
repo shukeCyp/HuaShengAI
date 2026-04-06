@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH).resolve()
@@ -22,6 +22,7 @@ datas += collect_data_files("playwright")
 datas += [
     (str(project_root / "app" / "web_dist"), "app/web_dist"),
 ]
+binaries = []
 
 if playwright_browser_dir:
     browser_root = Path(playwright_browser_dir)
@@ -32,8 +33,11 @@ if playwright_browser_dir:
 
 hiddenimports = collect_submodules("playwright")
 try:
-    datas += collect_data_files("paddleocr")
-    hiddenimports += collect_submodules("paddleocr")
+    for package_name in ("paddleocr", "paddle", "paddlex"):
+        package_datas, package_binaries, package_hiddenimports = collect_all(package_name)
+        datas += package_datas
+        binaries += package_binaries
+        hiddenimports += package_hiddenimports
 except Exception:
     pass
 if sys.platform == "darwin":
@@ -55,7 +59,7 @@ else:
 a = Analysis(
     ["app/main.py"],
     pathex=[str(project_root)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

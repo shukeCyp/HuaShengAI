@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from peewee import IntegrityError
+from peewee import IntegrityError, fn
 
 from app.database import database
 from app.models import AppSetting, BenchmarkAccount, MonitorRun, MonitoredArticle, now_local
@@ -847,12 +847,25 @@ class MicroHeadlineService:
         filters: dict[str, Any] | None = None,
     ) -> list[int]:
         normalized_filters = filters or {}
+        limit = self._normalize_non_negative_int(normalized_filters.get("limit"), default=0)
+        sort_by = str(normalized_filters.get("sortBy") or "").strip()
         with database.connection_context():
             query = self._build_monitored_articles_query(normalized_filters)
-            ordered_query = query.order_by(
-                MonitoredArticle.publish_time.desc(),
-                MonitoredArticle.updated_at.desc(),
-            )
+            if sort_by == "playCountDesc":
+                ordered_query = query.order_by(
+                    fn.COALESCE(MonitoredArticle.play_count, 0).desc(),
+                    MonitoredArticle.publish_time.desc(),
+                    MonitoredArticle.updated_at.desc(),
+                    MonitoredArticle.id.desc(),
+                )
+            else:
+                ordered_query = query.order_by(
+                    MonitoredArticle.publish_time.desc(),
+                    MonitoredArticle.updated_at.desc(),
+                    MonitoredArticle.id.desc(),
+                )
+            if limit > 0:
+                ordered_query = ordered_query.limit(limit)
             return [article.id for article in ordered_query]
 
     def run_account_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1216,6 +1229,14 @@ class MicroHeadlineService:
                 existing = MonitoredArticle.get_or_none(MonitoredArticle.dedupe_key == dedupe_key)
                 if existing is not None and existing.isdelete:
                     continue
+                article_content = _stringify(article.get("content"))
+                if article_content:
+                    existing_by_content = MonitoredArticle.get_or_none(
+                        MonitoredArticle.content == article_content,
+                        MonitoredArticle.isdelete == 0,
+                    )
+                    if existing_by_content is not None:
+                        continue
 
                 payload = {
                     "benchmark_account": benchmark_account,
@@ -1225,7 +1246,7 @@ class MicroHeadlineService:
                     "group_id": _stringify(article.get("groupId")),
                     "cell_type": _stringify(article.get("cellType")),
                     "title": _stringify(article.get("title")),
-                    "content": _stringify(article.get("content")),
+                    "content": article_content,
                     "publish_time": self._parse_datetime(article.get("publishTime")),
                     "source": _stringify(article.get("source")),
                     "media_name": _stringify(article.get("mediaName")),

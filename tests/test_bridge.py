@@ -149,6 +149,35 @@ class AppApiModelActionTests(unittest.TestCase):
         self.assertEqual(payload["selectedPath"], "/tmp/image.png")
         self.assertFalse(payload["cancelled"])
 
+    def test_get_log_status_delegates_to_service(self) -> None:
+        with patch.object(
+            self.service,
+            "get_log_status_payload",
+            return_value={
+                "logDir": "/tmp/logs",
+                "fileCount": 3,
+                "totalSizeBytes": 1024,
+            },
+        ) as mocked_status:
+            payload = self.api.get_log_status()
+
+        mocked_status.assert_called_once_with()
+        self.assertEqual(payload["logDir"], "/tmp/logs")
+        self.assertEqual(payload["fileCount"], 3)
+
+    def test_open_logs_directory_delegates_to_bridge(self) -> None:
+        log_dir = self.service.resolve_log_directory_path()
+        with patch.object(
+            self.bridge,
+            "open_directory_in_file_manager",
+            return_value=str(log_dir),
+        ) as mocked_open:
+            payload = self.api.open_logs_directory()
+
+        mocked_open.assert_called_once_with(str(log_dir))
+        self.assertEqual(payload["openedPath"], str(log_dir))
+        self.assertEqual(payload["databasePath"], str(self.db_path))
+
     def test_save_global_settings_delegates_to_service_with_website_check_flag(self) -> None:
         with patch.object(
             self.service,

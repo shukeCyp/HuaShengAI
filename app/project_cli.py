@@ -13,6 +13,7 @@ from app.accounts import AccountService
 from app.config import resolve_data_dir, resolve_db_path
 from app.database import close_database, init_database
 from app.huasheng import HuaShengAutomation
+from app.logging_utils import configure_application_logging
 
 DEFAULT_SCRIPT = "这是一个命令行创建的测试项目，用于验证花生项目创建接口和进度轮询接口。"
 DEFAULT_VOICE_ID = 6036542
@@ -23,10 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
+    log_dir = configure_application_logging(resolve_db_path(), level_name="INFO")
+    logger.info("CLI logging configured log_dir=%s", log_dir)
 
 
 def mask_phone(value: str) -> str:

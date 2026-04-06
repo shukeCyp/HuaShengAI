@@ -21,6 +21,7 @@ from peewee import IntegrityError
 
 from app.database import database
 from app.huasheng import HuaShengAutomation
+from app.logging_utils import resolve_daily_log_path, resolve_log_directory_from_db_path
 from app.models import (
     Account,
     AppSetting,
@@ -1005,6 +1006,57 @@ class AccountService:
             updated_at=setting.updated_at,
         )
 
+    def get_log_status_payload(self) -> dict[str, Any]:
+        log_dir = self.resolve_log_directory_path()
+        items: list[dict[str, Any]] = []
+        total_size_bytes = 0
+
+        for log_path in self.list_log_file_paths(log_dir):
+            try:
+                stat_result = log_path.stat()
+            except OSError:
+                continue
+
+            size_bytes = int(stat_result.st_size or 0)
+            total_size_bytes += size_bytes
+            items.append(
+                {
+                    "name": log_path.name,
+                    "path": str(log_path),
+                    "sizeBytes": size_bytes,
+                    "updatedAt": datetime.fromtimestamp(stat_result.st_mtime).replace(
+                        microsecond=0
+                    ).isoformat(sep=" ", timespec="seconds"),
+                }
+            )
+
+        current_log_path = resolve_daily_log_path(log_dir)
+        current_log_item = next(
+            (item for item in items if item["path"] == str(current_log_path)),
+            None,
+        )
+        latest_log_item = items[0] if items else None
+
+        return {
+            "logDir": str(log_dir),
+            "fileCount": len(items),
+            "totalSizeBytes": total_size_bytes,
+            "currentFileName": current_log_path.name,
+            "currentFilePath": str(current_log_path),
+            "currentFileSizeBytes": (
+                int(current_log_item["sizeBytes"]) if current_log_item is not None else 0
+            ),
+            "latestFileName": str(latest_log_item["name"]) if latest_log_item else "",
+            "latestFileSizeBytes": (
+                int(latest_log_item["sizeBytes"]) if latest_log_item is not None else 0
+            ),
+            "latestUpdatedAt": (
+                str(latest_log_item["updatedAt"]) if latest_log_item is not None else ""
+            ),
+            "files": items[:20],
+            "databasePath": str(self.db_path),
+        }
+
     def save_global_settings(
         self,
         thread_pool_size: int,
@@ -1565,32 +1617,48 @@ class AccountService:
             ("paddle", "paddlepaddle"),
             ("paddlex", "paddlex"),
         ):
-            installed = self.is_python_module_installed(module_name)
-            importable = False
-            error_message = ""
-            if installed:
-                try:
-                    importlib.import_module(module_name)
-                    importable = True
-                except Exception as exc:
-                    error_message = str(exc).strip() or exc.__class__.__name__
-
             items.append(
-                {
-                    "module": module_name,
-                    "package": package_name,
-                    "installed": installed,
-                    "importable": importable,
-                    "errorMessage": error_message,
-                }
+                self.inspect_ocr_dependency_item(module_name, package_name)
             )
         return items
 
-    def is_python_module_installed(self, module_name: str) -> bool:
+    def inspect_ocr_dependency_item(
+        self,
+        module_name: str,
+        package_name: str,
+    ) -> dict[str, Any]:
         try:
-            return importlib.util.find_spec(module_name) is not None
-        except Exception:
-            return False
+            importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            missing_name = str(getattr(exc, "name", "") or "").strip()
+            installed = bool(missing_name) and missing_name != module_name
+            if installed:
+                error_message = f"缺少依赖模块: {missing_name}"
+            else:
+                error_message = f"未找到模块: {module_name}"
+            return {
+                "module": module_name,
+                "package": package_name,
+                "installed": installed,
+                "importable": False,
+                "errorMessage": error_message,
+            }
+        except Exception as exc:
+            return {
+                "module": module_name,
+                "package": package_name,
+                "installed": True,
+                "importable": False,
+                "errorMessage": str(exc).strip() or exc.__class__.__name__,
+            }
+
+        return {
+            "module": module_name,
+            "package": package_name,
+            "installed": True,
+            "importable": True,
+            "errorMessage": "",
+        }
 
     def configure_paddle_runtime_env(self) -> Path:
         cache_dir = self.resolve_paddle_cache_home()
@@ -3768,6 +3836,32 @@ class AccountService:
         cache_directory = self.db_path.parent / ".paddle-cache" / "paddlex"
         cache_directory.mkdir(parents=True, exist_ok=True)
         return cache_directory.resolve()
+
+    def resolve_log_directory_path(self) -> Path:
+        log_directory = resolve_log_directory_from_db_path(self.db_path)
+        log_directory.mkdir(parents=True, exist_ok=True)
+        return log_directory.resolve()
+
+    def list_log_file_paths(self, log_dir: Path | None = None) -> list[Path]:
+        target_dir = (log_dir or self.resolve_log_directory_path()).resolve()
+        if not target_dir.exists():
+            return []
+
+        def sort_key(path: Path) -> float:
+            try:
+                return float(path.stat().st_mtime)
+            except OSError:
+                return 0.0
+
+        return sorted(
+            (
+                path
+                for path in target_dir.glob("*.log")
+                if path.is_file()
+            ),
+            key=sort_key,
+            reverse=True,
+        )
 
     def resolve_download_directory_path(self) -> Path:
         settings = self.get_global_settings_payload()["settings"]

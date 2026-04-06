@@ -195,6 +195,10 @@ const globalSettingsLoading = ref(false)
 const globalSettingsSaving = ref(false)
 const globalSettingsLoaded = ref(false)
 const globalSettingsLastSavedAt = ref('')
+const logStatusLoading = ref(false)
+const logFolderOpening = ref(false)
+const logStatusLoaded = ref(false)
+const logStatus = ref(null)
 const ocrModelStatusLoading = ref(false)
 const ocrModelDownloadLoading = ref(false)
 const ocrModelStatusLoaded = ref(false)
@@ -622,6 +626,13 @@ const globalSettingsSummary = computed(() => {
   return `线程池 ${Number(globalSettings.threadPoolSize || DEFAULT_GLOBAL_SETTINGS.threadPoolSize)} 个线程 · ${downloadLabel} · ${websiteCheckLabel}`
 })
 
+const logStatusSummary = computed(() => {
+  if (!logStatus.value) {
+    return '尚未加载日志监控'
+  }
+  return `${Number(logStatus.value.fileCount || 0)} 个文件 · ${formatByteSize(logStatus.value.totalSizeBytes)}`
+})
+
 const ocrModelSummary = computed(() => {
   if (!ocrModelStatus.value) {
     return '尚未检查 OCR 模型状态'
@@ -782,6 +793,9 @@ function activateSettingsTab(tabKey) {
   setActiveSettingsTab(tabKey)
   if (tabKey === 'global' && desktopReady.value && !globalSettingsLoaded.value) {
     loadGlobalSettings('全局设置已载入')
+  }
+  if (tabKey === 'global' && desktopReady.value && !logStatusLoaded.value) {
+    loadLogStatus('日志监控已载入')
   }
   if (tabKey === 'huasheng' && desktopReady.value && !subtitleSettingsLoaded.value) {
     loadSubtitleSettings('字幕设置已载入')
@@ -1210,6 +1224,26 @@ function applyGlobalSettingsPayload(payload) {
   }
 }
 
+function applyLogStatusPayload(payload) {
+  logStatus.value = {
+    logDir: String(payload?.logDir || ''),
+    fileCount: Number(payload?.fileCount || 0),
+    totalSizeBytes: Number(payload?.totalSizeBytes || 0),
+    currentFileName: String(payload?.currentFileName || ''),
+    currentFilePath: String(payload?.currentFilePath || ''),
+    currentFileSizeBytes: Number(payload?.currentFileSizeBytes || 0),
+    latestFileName: String(payload?.latestFileName || ''),
+    latestFileSizeBytes: Number(payload?.latestFileSizeBytes || 0),
+    latestUpdatedAt: String(payload?.latestUpdatedAt || ''),
+    files: Array.isArray(payload?.files) ? payload.files : []
+  }
+  logStatusLoaded.value = true
+
+  if (payload?.databasePath) {
+    databasePath.value = payload.databasePath
+  }
+}
+
 function applyOcrModelStatusPayload(payload) {
   ocrModelStatus.value = {
     engine: String(payload?.engine || 'PaddleOCR'),
@@ -1298,6 +1332,47 @@ async function saveGlobalSettings() {
     statusMessage.value = `保存全局设置失败: ${error instanceof Error ? error.message : String(error)}`
   } finally {
     globalSettingsSaving.value = false
+  }
+}
+
+async function loadLogStatus(message = '日志监控已载入') {
+  if (!desktopReady.value) {
+    return null
+  }
+
+  logStatusLoading.value = true
+
+  try {
+    const payload = await callDesktop('get_log_status')
+    applyLogStatusPayload(payload)
+    statusMessage.value = `${message} · ${logStatusSummary.value}`
+    return payload
+  } catch (error) {
+    logStatusLoaded.value = false
+    statusMessage.value = `加载日志监控失败: ${error instanceof Error ? error.message : String(error)}`
+    return null
+  } finally {
+    logStatusLoading.value = false
+  }
+}
+
+async function openLogsDirectory() {
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+
+  logFolderOpening.value = true
+
+  try {
+    const payload = await callDesktop('open_logs_directory')
+    const openedPath = String(payload?.openedPath || '')
+    statusMessage.value = openedPath ? `已打开日志目录：${openedPath}` : '已打开日志目录'
+    await loadLogStatus('日志监控已刷新')
+  } catch (error) {
+    statusMessage.value = `打开日志目录失败: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    logFolderOpening.value = false
   }
 }
 
@@ -3273,11 +3348,11 @@ watch(selectedTtsVoiceId, (value) => {
         <div v-if="taskCount" class="task-table-shell">
           <div class="task-table">
             <div class="task-table-head">
-              <span>ID</span>
-              <span>标题 / 文本</span>
-              <span>状态</span>
-              <span>重试</span>
-              <span>下载</span>
+              <span class="task-head-cell task-col-id">ID</span>
+              <span class="task-head-cell task-col-preview">标题 / 文本</span>
+              <span class="task-head-cell task-col-status">状态</span>
+              <span class="task-head-cell task-col-action">重试</span>
+              <span class="task-head-cell task-col-action">下载</span>
             </div>
 
             <article
@@ -3285,14 +3360,14 @@ watch(selectedTtsVoiceId, (value) => {
               :key="task.id"
               class="task-table-row"
             >
-              <span class="task-cell task-cell-id">{{ task.id }}</span>
+              <span class="task-cell task-cell-id task-col-id">{{ task.id }}</span>
               <span
-                class="task-cell task-cell-preview"
+                class="task-cell task-cell-preview task-col-preview"
                 :title="getTaskPrimaryText(task) || '--'"
               >
                 {{ getTaskListPreview(task) }}
               </span>
-              <span class="task-cell task-cell-status">
+              <span class="task-cell task-cell-status task-col-status">
                 <span class="task-status-content">
                   <span class="task-status-chip">{{ getTaskDisplayStatus(task) }}</span>
                   <small v-if="getTaskStatusDetail(task)" class="task-status-detail">
@@ -3300,7 +3375,7 @@ watch(selectedTtsVoiceId, (value) => {
                   </small>
                 </span>
               </span>
-              <span class="task-cell task-cell-actions">
+              <span class="task-cell task-cell-actions task-col-action">
                 <button
                   v-if="isTaskRetryable(task)"
                   type="button"
@@ -3312,7 +3387,7 @@ watch(selectedTtsVoiceId, (value) => {
                 </button>
                 <span v-else class="task-download-placeholder">--</span>
               </span>
-              <span class="task-cell task-cell-actions">
+              <span class="task-cell task-cell-actions task-col-action">
                 <button
                   v-if="task.videoUrl"
                   type="button"
@@ -4325,6 +4400,81 @@ watch(selectedTtsVoiceId, (value) => {
             </section>
 
             <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>日志设置</strong>
+                <small>日志会自动保存到数据库同级目录的 `logs` 文件夹，按天拆分成单独文件</small>
+              </div>
+              <div class="download-directory-actions">
+                <button
+                  type="button"
+                  class="toolbar-button secondary"
+                  :disabled="logStatusLoading || logFolderOpening || !desktopReady"
+                  @click="loadLogStatus('日志监控已刷新')"
+                >
+                  {{ logStatusLoading ? '刷新中...' : '刷新日志监控' }}
+                </button>
+                <button
+                  type="button"
+                  class="toolbar-button secondary"
+                  :disabled="logFolderOpening || !desktopReady"
+                  @click="openLogsDirectory"
+                >
+                  {{ logFolderOpening ? '打开中...' : '打开日志文件夹' }}
+                </button>
+              </div>
+              <div class="tts-account-strip voice-settings-strip">
+                <div class="tts-account-card">
+                  <span>日志目录</span>
+                  <strong>{{ getPathTail(logStatus?.logDir) }}</strong>
+                  <small>{{ logStatus?.logDir || '尚未加载' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>日志文件个数</span>
+                  <strong>{{ logStatus ? Number(logStatus.fileCount || 0) : '--' }}</strong>
+                  <small>{{ logStatusSummary }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>日志总大小</span>
+                  <strong>{{ formatByteSize(logStatus?.totalSizeBytes) }}</strong>
+                  <small>最近 20 个文件会展示在下方</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>今日日志</span>
+                  <strong>{{ logStatus?.currentFileName || '--' }}</strong>
+                  <small>{{ formatByteSize(logStatus?.currentFileSizeBytes) }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>最近更新</span>
+                  <strong>{{ logStatus?.latestFileName || '--' }}</strong>
+                  <small>{{ logStatus?.latestUpdatedAt || '尚未生成日志文件' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>当前版本</span>
+                  <strong>{{ displayAppVersion }}</strong>
+                  <small>版本号由桌面后端统一提供</small>
+                </div>
+              </div>
+            </section>
+
+            <section v-if="(logStatus?.files || []).length" class="settings-block">
+              <div class="settings-block-head">
+                <strong>日志监控</strong>
+                <small>显示最近 20 个日志文件的名称、大小和更新时间</small>
+              </div>
+              <div class="tts-account-strip voice-settings-strip">
+                <div
+                  v-for="item in logStatus.files"
+                  :key="item.path || item.name"
+                  class="tts-account-card"
+                >
+                  <span>{{ item.name }}</span>
+                  <strong>{{ formatByteSize(item.sizeBytes) }}</strong>
+                  <small>{{ item.updatedAt || item.path }}</small>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-block">
               <div class="tts-account-strip voice-settings-strip">
                 <div class="tts-account-card">
                   <span>当前线程池</span>
@@ -4345,11 +4495,6 @@ watch(selectedTtsVoiceId, (value) => {
                   <span>网址审核</span>
                   <strong>{{ normalizeGlobalCheckWebsiteLinks(globalSettings.checkWebsiteLinks) ? '开启' : '关闭' }}</strong>
                   <small>{{ normalizeGlobalCheckWebsiteLinks(globalSettings.checkWebsiteLinks) ? 'S4 完成后会先做封面 OCR 链接检查' : '当前不会执行封面 OCR 链接检查' }}</small>
-                </div>
-                <div class="tts-account-card">
-                  <span>当前版本</span>
-                  <strong>{{ displayAppVersion }}</strong>
-                  <small>版本号由桌面后端统一提供</small>
                 </div>
                 <div class="tts-account-card">
                   <span>最近保存</span>

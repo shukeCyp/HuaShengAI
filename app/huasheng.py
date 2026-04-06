@@ -344,6 +344,15 @@ class HuaShengAutomation:
             method=method,
         )
         start_time = perf_counter()
+        logger.info(
+            "[%s] 请求开始 method=%s url=%s params=%s body=%s cookie_keys=%s",
+            action_name,
+            method,
+            url,
+            self._summarize_log_value(params),
+            self._summarize_log_value(json_body),
+            self._summarize_cookie_keys(cookies),
+        )
 
         try:
             with urlopen(request, timeout=self.timeout) as response:
@@ -351,12 +360,14 @@ class HuaShengAutomation:
                 payload = self._parse_json_text(text, action_name)
                 duration_ms = (perf_counter() - start_time) * 1000
                 logger.info(
-                    "[%s] 请求完成 method=%s url=%s status=%s duration_ms=%.1f",
+                    "[%s] 请求完成 method=%s url=%s status=%s duration_ms=%.1f content_length=%s response=%s",
                     action_name,
                     method,
                     url,
                     status_code,
                     duration_ms,
+                    response_headers.get("Content-Length", ""),
+                    self._summarize_log_value(payload),
                 )
                 return payload
         except HTTPError as exc:
@@ -364,13 +375,15 @@ class HuaShengAutomation:
             duration_ms = (perf_counter() - start_time) * 1000
             detail = self._summarize_error_detail(text, exc.reason)
             logger.error(
-                "[%s] 请求失败 method=%s url=%s status=%s duration_ms=%.1f detail=%s",
+                "[%s] 请求失败 method=%s url=%s status=%s duration_ms=%.1f content_length=%s detail=%s response=%s",
                 action_name,
                 method,
                 url,
                 status_code,
                 duration_ms,
+                response_headers.get("Content-Length", ""),
                 detail,
+                self._summarize_log_value(text),
             )
             raise RuntimeError(f"{action_name}失败，HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
@@ -397,7 +410,7 @@ class HuaShengAutomation:
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
-            logger.error("[%s] JSON 解析失败", action_name)
+            logger.error("[%s] JSON 解析失败 response=%s", action_name, self._summarize_log_value(text))
             raise RuntimeError(f"{action_name}失败: 接口返回了无效 JSON。") from exc
 
     def _decode_body(self, body: bytes, content_encoding: str) -> str:
@@ -438,6 +451,29 @@ class HuaShengAutomation:
             ]
 
         return normalized
+
+    def _summarize_log_value(self, value: Any, *, limit: int = 500) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, (dict, list, tuple)):
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(value)
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    def _summarize_cookie_keys(self, cookies: str) -> str:
+        try:
+            parsed = SimpleCookie()
+            parsed.load(cookies)
+            keys = sorted(parsed.keys())
+        except Exception:
+            return "-"
+        if not keys:
+            return "-"
+        return ",".join(keys)
 
     def _parse_json_field(self, value: Any) -> dict[str, Any] | list[Any] | None:
         if not isinstance(value, str) or not value.strip():

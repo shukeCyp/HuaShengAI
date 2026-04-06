@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.database import close_database, database, init_database
+from app.models import MonitoredArticle
 from app.microheadline import (
     AutomationSettings,
     FeedCapture,
@@ -110,6 +111,92 @@ class MicroHeadlineServiceTests(unittest.TestCase):
         self.assertEqual(deleted["deletedCount"], 2)
         self.assertEqual(deleted["databasePath"], str(self.db_path))
         self.assertEqual(payload_after_delete["total"], 0)
+
+    def test_persist_monitored_articles_skips_duplicate_content(self) -> None:
+        created = self.service.create_benchmark_account("https://www.toutiao.com/c/user/token/example/")
+
+        with database.connection_context():
+            account = self.service._get_benchmark_account(created["id"])
+            run = self.service._create_monitor_run(account, account.url)
+            saved_count = self.service._persist_monitored_articles(
+                account,
+                run,
+                [
+                    {
+                        "itemId": "item-1",
+                        "title": "标题 1",
+                        "content": "重复正文",
+                        "publishTime": "2026-04-04 10:00:00",
+                        "playCount": 100,
+                    },
+                    {
+                        "itemId": "item-2",
+                        "title": "标题 2",
+                        "content": "重复正文",
+                        "publishTime": "2026-04-04 11:00:00",
+                        "playCount": 200,
+                    },
+                ],
+            )
+
+        payload = self.service.list_monitored_articles({}, 1, 20)
+
+        self.assertEqual(saved_count, 1)
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["content"], "重复正文")
+
+    def test_list_monitored_article_ids_supports_play_count_desc_limit(self) -> None:
+        created = self.service.create_benchmark_account("https://www.toutiao.com/c/user/token/example/")
+
+        with database.connection_context():
+            account = self.service._get_benchmark_account(created["id"])
+            run = self.service._create_monitor_run(account, account.url)
+            self.service._persist_monitored_articles(
+                account,
+                run,
+                [
+                    {
+                        "itemId": "item-1",
+                        "title": "标题 1",
+                        "content": "正文 1",
+                        "publishTime": "2026-04-04 10:00:00",
+                        "playCount": 100,
+                    },
+                    {
+                        "itemId": "item-2",
+                        "title": "标题 2",
+                        "content": "正文 2",
+                        "publishTime": "2026-04-04 11:00:00",
+                        "playCount": 500,
+                    },
+                    {
+                        "itemId": "item-3",
+                        "title": "标题 3",
+                        "content": "正文 3",
+                        "publishTime": "2026-04-04 12:00:00",
+                        "playCount": 300,
+                    },
+                ],
+            )
+            title_to_id = {
+                article.title: article.id
+                for article in MonitoredArticle.select(
+                    MonitoredArticle.id,
+                    MonitoredArticle.title,
+                )
+            }
+
+        article_ids = self.service.list_monitored_article_ids(
+            {
+                "sortBy": "playCountDesc",
+                "limit": 2,
+            }
+        )
+
+        self.assertEqual(
+            article_ids,
+            [title_to_id["标题 2"], title_to_id["标题 3"]],
+        )
 
 
 class MicroHeadlineAccountMonitorBoundaryTests(unittest.TestCase):

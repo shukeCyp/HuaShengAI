@@ -11,6 +11,7 @@ from app.bridge import AppApi, DesktopBridge, build_menu
 from app.config import resolve_db_path, resolve_resource_root
 from app.database import close_database, init_database
 from app.huasheng import HuaShengAutomation
+from app.logging_utils import configure_application_logging
 from app.microheadline import MicroHeadlineService
 
 
@@ -35,22 +36,20 @@ def resolve_index_file() -> Path:
     return index_file
 
 
-def configure_logging() -> None:
+def configure_logging(db_path: Path) -> None:
     level_name = os.environ.get("HUASHENGAI_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
+    log_dir = configure_application_logging(db_path, level_name=level_name)
+    logger.info("Application logging configured log_dir=%s level=%s", log_dir, level_name)
 
 
 def main() -> None:
-    configure_logging()
+    db_path = resolve_db_path()
+    configure_logging(db_path)
     index_file = resolve_index_file()
     debug = os.environ.get("PYWEBVIEW_DEBUG", "0") == "1"
     title = os.environ.get("PYWEBVIEW_TITLE", "HuaShengAI")
     logger.info("Launching HuaShengAI title=%s debug=%s index=%s", title, debug, index_file)
-    db_path = init_database(resolve_db_path())
+    db_path = init_database(db_path)
     huasheng = HuaShengAutomation()
     account_service = AccountService(db_path, huasheng=huasheng)
     account_service.bootstrap()

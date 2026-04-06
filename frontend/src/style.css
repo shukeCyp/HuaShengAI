@@ -518,21 +518,43 @@ html, body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-card);
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .task-table {
   display: flex;
   flex-direction: column;
+  min-width: 760px;
 }
 
 .task-table-head,
 .task-table-row {
-  display: grid;
-  grid-template-columns: 100px minmax(0, 1fr) 160px 120px;
+  display: flex;
   gap: 16px;
   align-items: center;
   padding: 16px 18px;
+}
+
+.task-head-cell,
+.task-cell {
+  min-width: 0;
+}
+
+.task-col-id {
+  flex: 0 0 72px;
+}
+
+.task-col-preview {
+  flex: 2.8 1 0;
+}
+
+.task-col-status {
+  flex: 1.5 1 0;
+}
+
+.task-col-action {
+  flex: 0 0 108px;
 }
 
 .task-table-head {
@@ -546,6 +568,7 @@ html, body {
   letter-spacing: 0.8px;
   color: var(--text-muted);
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .task-table-row {
@@ -557,7 +580,6 @@ html, body {
 }
 
 .task-cell {
-  min-width: 0;
   font-size: 14px;
   color: var(--text-primary);
 }
@@ -592,12 +614,13 @@ html, body {
 
 .task-cell-actions {
   display: flex;
-  justify-content: flex-end;
+  justify-content: center;
   align-items: center;
 }
 
+.task-retry-button,
 .task-download-button {
-  min-width: 88px;
+  min-width: 84px;
 }
 
 .task-download-placeholder {
@@ -1683,6 +1706,27 @@ html, body {
   min-width: 140px;
 }
 
+.image-ocr-picker-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.image-ocr-path-field {
+  flex: 1;
+}
+
+.image-ocr-lab .form-field input[readonly] {
+  background: #ffffff;
+  border-color: rgba(21, 32, 43, 0.1);
+  color: #132238;
+}
+
+.image-ocr-picker-button {
+  min-width: 120px;
+  min-height: 48px;
+}
+
 .model-debug-actions {
   display: flex;
   align-items: center;
@@ -1785,7 +1829,8 @@ html, body {
 @media (max-width: 1100px) {
   .tts-lab-header,
   .tts-action-row,
-  .tts-selection-bar {
+  .tts-selection-bar,
+  .image-ocr-picker-row {
     flex-direction: column;
   }
 
@@ -1889,7 +1934,23 @@ html, body {
     align-items: flex-start;
   }
   .task-table-head,
-  .task-table-row,
+  .task-table-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .task-table {
+    min-width: 0;
+  }
+  .task-col-id,
+  .task-col-preview,
+  .task-col-status,
+  .task-col-action {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+  .task-cell-actions {
+    justify-content: flex-start;
+  }
   .task-status-summary-grid {
     grid-template-columns: 1fr;
   }
