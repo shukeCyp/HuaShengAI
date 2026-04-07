@@ -24,6 +24,12 @@
 ./run.sh
 ```
 
+Windows 下也可以直接执行：
+
+```bat
+run.bat
+```
+
 这个脚本会完成以下操作：
 
 - 使用 `uv` 同步 Python 依赖
@@ -38,6 +44,12 @@
 
 ```sh
 ./package.sh
+```
+
+Windows 下也可以直接执行：
+
+```bat
+build_exe.bat
 ```
 
 这个脚本会完成以下操作：

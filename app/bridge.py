@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -21,10 +21,6 @@ from app.microheadline import MicroHeadlineService
 logger = logging.getLogger(__name__)
 
 DESKTOP_EVENT_NAME = "huashengai:desktop-event"
-IMAGE_FILE_DIALOG_TYPES = (
-    "图片文件 (*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff)",
-    "所有文件 (*.*)",
-)
 
 
 class DesktopBridge:
@@ -170,32 +166,6 @@ class DesktopBridge:
             dialog_type=dialog_enum,
             directory=str(directory or ""),
             allow_multiple=False,
-        )
-        if not result:
-            return ""
-
-        if isinstance(result, (list, tuple)):
-            return str(result[0] or "")
-        return str(result or "")
-
-    def choose_file(
-        self,
-        directory: str = "",
-        *,
-        file_types: tuple[str, ...] | list[str] | None = None,
-    ) -> str:
-        if not self.window:
-            raise RuntimeError("窗口尚未初始化，无法选择文件。")
-
-        dialog_enum = getattr(getattr(webview, "FileDialog", None), "OPEN", None)
-        if dialog_enum is None:
-            dialog_enum = webview.OPEN_DIALOG
-
-        result = self.window.create_file_dialog(
-            dialog_type=dialog_enum,
-            directory=str(directory or ""),
-            allow_multiple=False,
-            file_types=tuple(file_types or ()),
         )
         if not result:
             return ""
@@ -401,18 +371,15 @@ class AppApi:
         self,
         thread_pool_size: int,
         download_dir: str | None = None,
-        check_website_links: bool | str | None = None,
     ) -> dict[str, Any]:
         logger.info(
-            "AppApi.save_global_settings called thread_pool_size=%s download_dir_length=%s check_website_links=%s",
+            "AppApi.save_global_settings called thread_pool_size=%s download_dir_length=%s",
             thread_pool_size,
             len(str(download_dir or "")),
-            check_website_links,
         )
         return self._account_service.save_global_settings(
             thread_pool_size,
             None if download_dir is None else str(download_dir),
-            check_website_links,
         )
 
     def get_log_status(self) -> dict[str, Any]:
@@ -434,27 +401,6 @@ class AppApi:
             len(str(current_directory or "")),
         )
         selected_path = self._bridge.choose_directory(str(current_directory or ""))
-        return {
-            "selectedPath": selected_path,
-            "cancelled": not bool(selected_path),
-        }
-
-    def select_image_file(self, current_path: str = "") -> dict[str, Any]:
-        normalized_current_path = str(current_path or "").strip()
-        current_directory = ""
-        if normalized_current_path:
-            path = Path(normalized_current_path).expanduser()
-            current_directory = str(path.parent if path.suffix else path)
-
-        logger.info(
-            "AppApi.select_image_file called current_path_length=%s current_directory_length=%s",
-            len(normalized_current_path),
-            len(current_directory),
-        )
-        selected_path = self._bridge.choose_file(
-            current_directory,
-            file_types=IMAGE_FILE_DIALOG_TYPES,
-        )
         return {
             "selectedPath": selected_path,
             "cancelled": not bool(selected_path),
@@ -642,38 +588,6 @@ class AppApi:
                 str(api_key or ""),
                 normalized_model,
             ),
-        )
-
-    def ocr_image_text(self, image_path: str) -> dict[str, Any]:
-        normalized_image_path = str(image_path or "")
-        logger.info(
-            "AppApi.ocr_image_text called image_path_length=%s",
-            len(normalized_image_path),
-        )
-        return self._run_model_action(
-            action_name="ocr_image_text",
-            base_url="",
-            model="PaddleOCR",
-            extra={"imagePath": normalized_image_path},
-            runner=lambda: self._account_service.ocr_image_text(normalized_image_path),
-        )
-
-    def get_ocr_model_status(self) -> dict[str, Any]:
-        logger.info("AppApi.get_ocr_model_status called")
-        return self._run_model_action(
-            action_name="get_ocr_model_status",
-            base_url="",
-            model="PaddleOCR",
-            runner=self._account_service.get_ocr_model_status_payload,
-        )
-
-    def download_ocr_model(self) -> dict[str, Any]:
-        logger.info("AppApi.download_ocr_model called")
-        return self._run_model_action(
-            action_name="download_ocr_model",
-            base_url="",
-            model="PaddleOCR",
-            runner=self._account_service.download_ocr_models,
         )
 
     def get_microheadline_settings(self) -> dict[str, Any]:

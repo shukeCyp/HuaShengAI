@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -37,11 +37,6 @@ class FakeResponse:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         return None
-
-
-class FakePaddlePredictResult:
-    def __init__(self, payload) -> None:
-        self.json = payload
 
 
 class AccountServiceSubtitleSettingsTests(unittest.TestCase):
@@ -221,7 +216,6 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
         self.assertEqual(payload["settings"]["threadPoolSize"], 3)
         self.assertEqual(payload["settings"]["downloadDir"], "")
-        self.assertFalse(payload["settings"]["checkWebsiteLinks"])
         self.assertEqual(payload["scanIntervalSeconds"], 5)
         self.assertEqual(payload["threadPoolMinSize"], 1)
         self.assertEqual(payload["threadPoolMaxSize"], 32)
@@ -230,15 +224,13 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
     def test_save_global_settings_persists_thread_pool_size(self) -> None:
         download_dir = Path(self.temp_dir.name) / "downloads"
-        saved = self.service.save_global_settings(6, str(download_dir), True)
+        saved = self.service.save_global_settings(6, str(download_dir))
         loaded = self.service.get_global_settings_payload()
 
         self.assertEqual(saved["settings"]["threadPoolSize"], 6)
         self.assertEqual(saved["settings"]["downloadDir"], str(download_dir.resolve()))
-        self.assertTrue(saved["settings"]["checkWebsiteLinks"])
         self.assertEqual(loaded["settings"]["threadPoolSize"], 6)
         self.assertEqual(loaded["settings"]["downloadDir"], str(download_dir.resolve()))
-        self.assertTrue(loaded["settings"]["checkWebsiteLinks"])
 
     def test_get_log_status_payload_reports_log_directory_file_count_and_size(self) -> None:
         log_dir = self.service.resolve_log_directory_path()
@@ -255,156 +247,6 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(len(payload["files"]), 2)
         self.assertTrue(payload["currentFileName"].startswith("huashengai-"))
         self.assertIn("databasePath", payload)
-
-    def test_get_ocr_model_status_payload_reports_not_downloaded_when_cache_is_empty(self) -> None:
-        with patch.object(
-            self.service,
-            "collect_ocr_dependency_items",
-            return_value=[
-                {
-                    "module": "paddleocr",
-                    "package": "paddleocr",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-                {
-                    "module": "paddle",
-                    "package": "paddlepaddle",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-                {
-                    "module": "paddlex",
-                    "package": "paddlex",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-            ],
-        ):
-            payload = self.service.get_ocr_model_status_payload()
-
-        self.assertEqual(payload["engine"], "PaddleOCR")
-        self.assertEqual(payload["status"], "not_downloaded")
-        self.assertFalse(payload["ready"])
-        self.assertFalse(payload["verified"])
-        self.assertEqual(payload["artifactFileCount"], 0)
-
-    def test_get_ocr_model_status_payload_reports_ready_when_marker_exists(self) -> None:
-        cache_dir = self.service.resolve_paddle_cache_home()
-        model_dir = cache_dir / "official_models" / "det"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        (model_dir / "model.pdmodel").write_bytes(b"model")
-        self.service.persist_ocr_model_ready_marker()
-
-        with patch.object(
-            self.service,
-            "collect_ocr_dependency_items",
-            return_value=[
-                {
-                    "module": "paddleocr",
-                    "package": "paddleocr",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-                {
-                    "module": "paddle",
-                    "package": "paddlepaddle",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-                {
-                    "module": "paddlex",
-                    "package": "paddlex",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-            ],
-        ):
-            payload = self.service.get_ocr_model_status_payload()
-
-        self.assertEqual(payload["status"], "ready")
-        self.assertTrue(payload["ready"])
-        self.assertTrue(payload["verified"])
-        self.assertEqual(payload["artifactFileCount"], 1)
-        self.assertTrue(payload["verifiedAt"])
-
-    def test_download_ocr_models_marks_model_ready_after_successful_initialization(self) -> None:
-        cache_dir = self.service.resolve_paddle_cache_home()
-
-        def fake_initialize_engine():
-            model_dir = cache_dir / "official_models" / "rec"
-            model_dir.mkdir(parents=True, exist_ok=True)
-            (model_dir / "model.pdmodel").write_bytes(b"model")
-            self.service._paddle_ocr_engine = object()
-            self.service.persist_ocr_model_ready_marker()
-            return self.service._paddle_ocr_engine
-
-        with patch.object(
-            self.service,
-            "collect_ocr_dependency_items",
-            return_value=[
-                {
-                    "module": "paddleocr",
-                    "package": "paddleocr",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-                {
-                    "module": "paddle",
-                    "package": "paddlepaddle",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-                {
-                    "module": "paddlex",
-                    "package": "paddlex",
-                    "installed": True,
-                    "importable": True,
-                    "errorMessage": "",
-                },
-            ],
-        ), patch.object(
-            self.service,
-            "_get_paddle_ocr_engine",
-            side_effect=fake_initialize_engine,
-        ) as mocked_get_engine:
-            payload = self.service.download_ocr_models()
-
-        mocked_get_engine.assert_called_once()
-        self.assertTrue(payload["downloaded"])
-        self.assertTrue(payload["ready"])
-        self.assertEqual(payload["status"], "ready")
-        self.assertTrue(payload["verified"])
-
-    def test_inspect_ocr_dependency_item_marks_module_not_found_as_not_installed(self) -> None:
-        with patch(
-            "app.accounts.importlib.import_module",
-            side_effect=ModuleNotFoundError("No module named 'paddlex'", name="paddlex"),
-        ):
-            item = self.service.inspect_ocr_dependency_item("paddlex", "paddlex")
-
-        self.assertFalse(item["installed"])
-        self.assertFalse(item["importable"])
-        self.assertEqual(item["errorMessage"], "未找到模块: paddlex")
-
-    def test_inspect_ocr_dependency_item_marks_missing_nested_dependency_as_installed_but_unimportable(self) -> None:
-        with patch(
-            "app.accounts.importlib.import_module",
-            side_effect=ModuleNotFoundError("No module named 'yaml'", name="yaml"),
-        ):
-            item = self.service.inspect_ocr_dependency_item("paddleocr", "paddleocr")
-
-        self.assertTrue(item["installed"])
-        self.assertFalse(item["importable"])
-        self.assertEqual(item["errorMessage"], "缺少依赖模块: yaml")
 
     def test_save_model_settings_persists_prompt_rows(self) -> None:
         saved = self.service.save_model_settings(
@@ -536,145 +378,6 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
         self.assertEqual(captured["headers"]["Authorization"], "Bearer secret-token")
         self.assertEqual(result["content"], "改写完成")
-
-    def test_ocr_image_text_extracts_text_from_predict_results(self) -> None:
-        image_path = Path(self.temp_dir.name) / "sample.png"
-        image_path.write_bytes(b"fake-image")
-
-        class StubPredictEngine:
-            def predict(self, path):
-                self.last_path = path
-                return [
-                    FakePaddlePredictResult(
-                        {
-                            "res": {
-                                "rec_texts": ["第一行", "第二行"],
-                                "rec_scores": [0.9912, 0.8734],
-                                "rec_boxes": [
-                                    [[0, 0], [10, 0], [10, 10], [0, 10]],
-                                    [[0, 12], [12, 12], [12, 20], [0, 20]],
-                                ],
-                            }
-                        }
-                    )
-                ]
-
-        engine = StubPredictEngine()
-        with patch.object(self.service, "_get_paddle_ocr_engine", return_value=engine):
-            payload = self.service.ocr_image_text(str(image_path))
-
-        self.assertEqual(engine.last_path, str(image_path.resolve()))
-        self.assertEqual(payload["engine"], "PaddleOCR")
-        self.assertEqual(payload["imagePath"], str(image_path.resolve()))
-        self.assertEqual(payload["lineCount"], 2)
-        self.assertEqual(payload["text"], "第一行\n第二行")
-        self.assertEqual(payload["lines"][0]["text"], "第一行")
-        self.assertEqual(payload["lines"][0]["score"], 0.9912)
-
-    def test_ocr_image_text_falls_back_to_legacy_ocr_api(self) -> None:
-        image_path = Path(self.temp_dir.name) / "legacy.jpg"
-        image_path.write_bytes(b"fake-image")
-
-        class StubLegacyEngine:
-            def ocr(self, path, cls=True):
-                self.last_call = (path, cls)
-                return [
-                    [
-                        [
-                            [[0, 0], [8, 0], [8, 8], [0, 8]],
-                            ("旧版第一行", 0.9543),
-                        ],
-                    ]
-                ]
-
-        engine = StubLegacyEngine()
-        with patch.object(self.service, "_get_paddle_ocr_engine", return_value=engine):
-            payload = self.service.ocr_image_text(str(image_path))
-
-        self.assertEqual(engine.last_call, (str(image_path.resolve()), True))
-        self.assertEqual(payload["lineCount"], 1)
-        self.assertEqual(payload["text"], "旧版第一行")
-        self.assertEqual(payload["lines"][0]["score"], 0.9543)
-
-    def test_ocr_image_text_rejects_non_image_file(self) -> None:
-        file_path = Path(self.temp_dir.name) / "sample.txt"
-        file_path.write_text("not-image", encoding="utf-8")
-
-        with self.assertRaisesRegex(ValueError, "请选择支持的图片格式"):
-            self.service.ocr_image_text(str(file_path))
-
-    def test_extract_website_link_from_text_detects_common_domains(self) -> None:
-        self.assertEqual(
-            self.service.extract_website_link_from_text("封面写着 www.asd.com 立即访问"),
-            "www.asd.com",
-        )
-        self.assertEqual(
-            self.service.extract_website_link_from_text("还有 123432.cc 这样的裸域名"),
-            "123432.cc",
-        )
-        self.assertEqual(
-            self.service.extract_website_link_from_text("备用网址：https://demo.example.com/path"),
-            "https://demo.example.com/path",
-        )
-        self.assertEqual(
-            self.service.extract_website_link_from_text("换一种 OCR 标点 www。demo。com"),
-            "www.demo.com",
-        )
-        self.assertEqual(self.service.extract_website_link_from_text("这里没有网址"), "")
-
-    def test_build_paddle_ocr_init_attempts_prefers_lightweight_v3_flags(self) -> None:
-        class PaddleOCRV3:
-            def __init__(
-                self,
-                lang=None,
-                use_doc_orientation_classify=None,
-                use_doc_unwarping=None,
-                use_textline_orientation=None,
-                **kwargs,
-            ) -> None:
-                return None
-
-        attempts = self.service._build_paddle_ocr_init_attempts(PaddleOCRV3)
-
-        self.assertEqual(
-            attempts[0],
-            {
-                "lang": "ch",
-                "use_doc_orientation_classify": False,
-                "use_doc_unwarping": False,
-                "use_textline_orientation": False,
-            },
-        )
-        self.assertEqual(attempts[1], {"lang": "ch"})
-        self.assertEqual(attempts[-1], {})
-
-    def test_build_paddle_ocr_init_attempts_keeps_legacy_flags_for_old_signature(self) -> None:
-        class LegacyPaddleOCR:
-            def __init__(self, lang=None, show_log=True, use_angle_cls=True) -> None:
-                return None
-
-        attempts = self.service._build_paddle_ocr_init_attempts(LegacyPaddleOCR)
-
-        self.assertEqual(
-            attempts[0],
-            {
-                "lang": "ch",
-                "show_log": False,
-                "use_angle_cls": False,
-            },
-        )
-        self.assertEqual(attempts[1], {"lang": "ch", "show_log": False})
-        self.assertEqual(attempts[2], {"lang": "ch"})
-        self.assertEqual(attempts[-1], {})
-
-    def test_format_paddle_ocr_init_error_highlights_model_download_issue(self) -> None:
-        message = self.service._format_paddle_ocr_init_error(
-            RuntimeError("failed to download model from huggingface: timed out")
-        )
-
-        self.assertIn("首次运行需要下载 OCR 模型", message)
-        self.assertIn("HuggingFace/AiStudio", message)
-        self.assertIn("huggingface", message.lower())
 
     def test_build_rewrite_system_prompt_appends_fixed_format_instruction(self) -> None:
         prompt = self.service.build_rewrite_system_prompt("请把文章改写得更流畅。")
@@ -1901,151 +1604,6 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(task.status, "S4扫描中")
         self.assertEqual(task.huasheng_status, "任务已创建")
 
-    def test_run_huasheng_progress_task_blocks_export_when_cover_contains_website_link(self) -> None:
-        account = self.service.create_account(
-            "13800138000",
-            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
-            "发布账号A",
-            False,
-        )
-        self.service.save_global_settings(3, "", True)
-        created = self.service.create_task_record(
-            account["id"],
-            "113671485575170",
-            "S4扫描中",
-            article_id=101,
-            rewrite_prompt_id=1,
-            rewrite_prompt="提示词A",
-            rewritten_content="改写后的正文内容",
-            title="自动生成标题",
-            huasheng_status="处理中",
-        )
-
-        with patch.object(
-            self.service._huasheng,
-            "get_project_info",
-            return_value={
-                "project": {
-                    "id": "2470002",
-                    "pid": "113671485575170",
-                    "progress": 100,
-                    "state_message": "项目处理完成",
-                },
-                "clips": [
-                    {
-                        "idx": "1",
-                        "video": {
-                            "cover": "https://example.com/clip-cover-1.jpg",
-                        },
-                    }
-                ],
-            },
-        ) as mocked_project_info, patch.object(
-            self.service,
-            "ocr_remote_image_text",
-            return_value={
-                "text": "更多内容请访问 123432.cc",
-            },
-        ) as mocked_ocr, patch.object(
-            self.service._huasheng,
-            "edit_project",
-        ) as mocked_edit_project, patch.object(
-            self.service._huasheng,
-            "export_project_video",
-        ) as mocked_export_project:
-            self.service._run_huasheng_progress_task(created["id"])
-
-        task = self.service.get_task_record(created["id"])
-
-        mocked_project_info.assert_called_once_with(
-            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
-            pid="113671485575170",
-        )
-        mocked_ocr.assert_called_once_with("https://example.com/clip-cover-1.jpg")
-        mocked_edit_project.assert_not_called()
-        mocked_export_project.assert_not_called()
-        self.assertEqual(task.status, "S4失败")
-        self.assertEqual(task.progress, 100)
-        self.assertEqual(task.huasheng_status, "触发网站链接限制")
-        self.assertEqual(task.video_url, "")
-
-    def test_run_huasheng_progress_task_skips_cover_ocr_when_website_check_disabled(self) -> None:
-        account = self.service.create_account(
-            "13800138000",
-            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
-            "发布账号A",
-            False,
-        )
-        self.service.save_global_settings(3, "", False)
-        created = self.service.create_task_record(
-            account["id"],
-            "113671485575170",
-            "S4扫描中",
-            article_id=101,
-            rewrite_prompt_id=1,
-            rewrite_prompt="提示词A",
-            rewritten_content="改写后的正文内容",
-            title="自动生成标题",
-            huasheng_status="处理中",
-        )
-
-        with patch.object(
-            self.service._huasheng,
-            "get_project_info",
-            return_value={
-                "project": {
-                    "id": "2470002",
-                    "pid": "113671485575170",
-                    "progress": 100,
-                    "state_message": "项目处理完成",
-                },
-                "clips": [
-                    {
-                        "idx": "1",
-                        "video": {
-                            "cover": "https://example.com/clip-cover-1.jpg",
-                        },
-                    }
-                ],
-            },
-        ) as mocked_project_info, patch.object(
-            self.service,
-            "ocr_remote_image_text",
-        ) as mocked_ocr, patch.object(
-            self.service._huasheng,
-            "edit_project",
-            return_value={"code": 0, "message": "success"},
-        ) as mocked_edit_project, patch.object(
-            self.service._huasheng,
-            "export_project_video",
-            return_value={"task_id": "p2470002_37", "version": "37"},
-        ) as mocked_export_project, patch.object(
-            self.service._huasheng,
-            "get_project_export_info",
-            return_value={
-                "url": "http://example.com/video.mp4",
-                "progress": "100",
-                "cover": "",
-                "cover43": "",
-            },
-        ) as mocked_export_info:
-            self.service._run_huasheng_progress_task(created["id"])
-
-        task = self.service.get_task_record(created["id"])
-
-        mocked_project_info.assert_called_once_with(
-            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
-            pid="113671485575170",
-        )
-        mocked_ocr.assert_not_called()
-        mocked_edit_project.assert_called_once()
-        mocked_export_project.assert_called_once()
-        mocked_export_info.assert_called_once()
-        self.assertEqual(task.status, "导出完成")
-        self.assertEqual(task.huasheng_status, "导出完成")
-        self.assertEqual(task.video_url, "http://example.com/video.mp4")
-
-
     def test_run_huasheng_progress_task_exports_finished_project_and_persists_video(self) -> None:
         account = self.service.create_account(
             "13800138000",
@@ -2400,3 +1958,4 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

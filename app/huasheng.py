@@ -210,6 +210,34 @@ class HuaShengAutomation:
 
         return response
 
+    def edit_project_tts_settings(
+        self,
+        cookies: str,
+        *,
+        project_id: int,
+        voice_id: int,
+        speech_rate: float,
+    ) -> dict[str, Any]:
+        normalized_cookies = self._normalize_cookies(cookies)
+        payload = {
+            "id": self._normalize_int("id", project_id, minimum=1),
+            "voice_id": self._normalize_int("voice_id", voice_id, minimum=1),
+            "speech_rate": self._normalize_float("speech_rate", speech_rate, minimum=0),
+            "biliCSRF": self._extract_cookie_value(normalized_cookies, "bili_jct"),
+        }
+        response = self._request_json(
+            path=self.PROJECT_EDIT_PATH,
+            method="POST",
+            cookies=normalized_cookies,
+            json_body=payload,
+            action_name="设置项目TTS",
+        )
+
+        if not isinstance(response, dict):
+            raise RuntimeError("设置项目TTS失败: 接口返回不是 JSON 对象。")
+
+        return response
+
     def 编辑项目(
         self,
         cookies: str,

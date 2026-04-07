@@ -1,14 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 import html
-import importlib
-import inspect
 import json
 import logging
 import os
 import re
-import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
@@ -110,7 +108,6 @@ DEFAULT_MODEL_SETTINGS = {
 DEFAULT_GLOBAL_SETTINGS = {
     "threadPoolSize": 3,
     "downloadDir": "",
-    "checkWebsiteLinks": False,
 }
 DEFAULT_HUASHENG_VOICE_SETTINGS = {
     "voiceId": 0,
@@ -122,33 +119,12 @@ DEFAULT_HUASHENG_VOICE_SETTINGS = {
     "speechRate": 1,
     "maxConcurrentTasksPerAccount": 1,
 }
-SUPPORTED_IMAGE_SUFFIXES = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".bmp",
-    ".webp",
-    ".tif",
-    ".tiff",
-}
-OCR_ENGINE_NAME = "PaddleOCR"
-OCR_MODEL_READY_MARKER_FILENAME = ".ocr-model-ready.json"
-OCR_MODEL_SIGNATURE_SUFFIXES = {
-    ".pdmodel",
-    ".pdiparams",
-    ".onnx",
-}
-OCR_MODEL_SIGNATURE_FILENAMES = {
-    "inference.yml",
-    "inference.yaml",
-}
 MODEL_REQUEST_TIMEOUT = 60.0
 REWRITE_MODEL_REQUEST_TIMEOUT = 20 * 60.0
 TITLE_MODEL_REQUEST_TIMEOUT = 20 * 60.0
 VIDEO_DOWNLOAD_TIMEOUT = 300.0
 VIDEO_DOWNLOAD_MAX_RETRIES = 3
 VIDEO_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
-COVER_IMAGE_DOWNLOAD_TIMEOUT = 20.0
 MODEL_REQUEST_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -198,7 +174,6 @@ TASK_HUASHENG_STATUS_NOT_CREATED = "未创建"
 TASK_HUASHENG_STATUS_CREATED = "任务已创建"
 TASK_HUASHENG_STATUS_EXPORT_READY = "准备导出"
 TASK_HUASHENG_STATUS_EXPORT_FINISHED = "导出完成"
-TASK_HUASHENG_STATUS_WEBSITE_LINK_BLOCKED = "触发网站链接限制"
 TASK_HUASHENG_STATUS_WAIT_FOR_AVAILABLE_ACCOUNT = "暂无可用花生账号，等待下次扫描"
 TASK_STAGE_REWRITE = "rewrite"
 TASK_STAGE_TITLE = "title"
@@ -210,25 +185,12 @@ REWRITE_REDLINE_FUZZY_KEYWORDS = (
     "触发安全机制",
     "题材受限",
     "停止改写",
+    "已停止重构",
 )
 TASK_HUASHENG_STATUS_ACCOUNT_RETRY = "账号限额，等待重新分配"
 HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MIN = 1
 HUASHENG_ACCOUNT_MAX_CONCURRENT_TASKS_MAX = 50
-WEBSITE_LINK_PATTERN = re.compile(
-    r"(?i)(?:\b(?:https?|ftp)://[^\s]+|(?<![@A-Za-z0-9_])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?::\d{1,5})?(?:/[^\s]*)?(?=$|[^A-Za-z0-9_]))"
-)
-WEBSITE_LINK_TEXT_TRANSLATION = str.maketrans(
-    {
-        "。": ".",
-        "．": ".",
-        "｡": ".",
-        "／": "/",
-        "∕": "/",
-        "：": ":",
-    }
-)
-
-
+HUASHENG_PRE_EXPORT_EDIT_DELAY_SECONDS = 10.0
 logger = logging.getLogger(__name__)
 
 
@@ -250,9 +212,6 @@ class AccountService:
         self._task_executor: ThreadPoolExecutor | None = None
         self._task_executor_size = 0
         self._huasheng_account_selection_lock = Lock()
-        self._paddle_ocr_lock = Lock()
-        self._paddle_ocr_download_lock = Lock()
-        self._paddle_ocr_engine: Any | None = None
         self._rewrite_task_ids_inflight: set[int] = set()
         self._title_task_ids_inflight: set[int] = set()
         self._huasheng_create_task_ids_inflight: set[int] = set()
@@ -1061,7 +1020,6 @@ class AccountService:
         self,
         thread_pool_size: int,
         download_dir: str | None = None,
-        check_website_links: bool | str | None = None,
     ) -> dict[str, Any]:
         settings_input: dict[str, Any] = {
             "threadPoolSize": thread_pool_size,
@@ -1071,13 +1029,6 @@ class AccountService:
             settings_input["downloadDir"] = existing_settings.get("downloadDir", "")
         else:
             settings_input["downloadDir"] = download_dir
-        if check_website_links is None:
-            settings_input["checkWebsiteLinks"] = existing_settings.get(
-                "checkWebsiteLinks",
-                False,
-            )
-        else:
-            settings_input["checkWebsiteLinks"] = check_website_links
 
         settings = self.normalize_global_settings(settings_input)
         timestamp = now_local()
@@ -1506,597 +1457,6 @@ class AccountService:
             "requestUrl": normalized_base_url,
             "databasePath": str(self.db_path),
         }
-
-    def ocr_image_text(self, image_path: str) -> dict[str, Any]:
-        resolved_image_path = self.resolve_image_file_path(image_path)
-        engine = self._get_paddle_ocr_engine()
-        lines = self._recognize_image_text_lines(engine, resolved_image_path)
-        text = "\n".join(
-            str(item.get("text") or "").strip()
-            for item in lines
-            if str(item.get("text") or "").strip()
-        ).strip()
-        logger.info(
-            "Image OCR completed image=%s line_count=%s text_length=%s",
-            resolved_image_path,
-            len(lines),
-            len(text),
-        )
-        return {
-            "engine": OCR_ENGINE_NAME,
-            "imagePath": str(resolved_image_path),
-            "lineCount": len(lines),
-            "text": text,
-            "lines": lines,
-            "databasePath": str(self.db_path),
-        }
-
-    def get_ocr_model_status_payload(self) -> dict[str, Any]:
-        cache_dir = self.resolve_paddle_cache_home()
-        dependency_items = self.collect_ocr_dependency_items()
-        dependencies_ready = all(item["importable"] for item in dependency_items)
-        cache_writable, cache_writable_message = self.check_directory_writable(cache_dir)
-        artifact_summary = self.collect_ocr_model_artifact_summary(cache_dir)
-        marker_payload = self.load_ocr_model_ready_marker()
-        engine_initialized = self._paddle_ocr_engine is not None
-        verified = bool(marker_payload)
-
-        status = "not_downloaded"
-        ready = False
-        message = "还没有检测到本地 OCR 模型，请点击下载模型。"
-
-        if not dependencies_ready:
-            status = "missing_dependencies"
-            message = "OCR 运行依赖未就绪，请先确认 `paddleocr`、`paddlepaddle` 和 `paddlex` 已正确安装。"
-        elif not cache_writable:
-            status = "cache_unwritable"
-            message = cache_writable_message or "OCR 模型缓存目录不可写。"
-        elif engine_initialized:
-            status = "ready"
-            ready = True
-            message = "OCR 引擎已在当前进程初始化完成，可以直接使用。"
-        elif verified and artifact_summary["artifactFileCount"] > 0:
-            status = "ready"
-            ready = True
-            message = "已检测到本地 OCR 模型，并且存在成功校验记录。"
-        elif artifact_summary["artifactFileCount"] > 0:
-            status = "cached_unverified"
-            message = "已检测到本地模型文件，但还没有成功校验记录，建议点击下载模型补齐并校验。"
-
-        return {
-            "engine": OCR_ENGINE_NAME,
-            "status": status,
-            "ready": ready,
-            "message": message,
-            "dependenciesReady": dependencies_ready,
-            "dependencyItems": dependency_items,
-            "cacheDir": str(cache_dir),
-            "cacheExists": cache_dir.exists(),
-            "cacheWritable": cache_writable,
-            "cacheWritableMessage": cache_writable_message,
-            "artifactFileCount": artifact_summary["artifactFileCount"],
-            "artifactDirectoryCount": artifact_summary["artifactDirectoryCount"],
-            "cacheSizeBytes": artifact_summary["cacheSizeBytes"],
-            "sampleFiles": artifact_summary["sampleFiles"],
-            "engineInitialized": engine_initialized,
-            "verified": verified,
-            "verifiedAt": marker_payload.get("verifiedAt", "") if marker_payload else "",
-            "databasePath": str(self.db_path),
-        }
-
-    def download_ocr_models(self) -> dict[str, Any]:
-        if not self._paddle_ocr_download_lock.acquire(blocking=False):
-            raise RuntimeError("OCR 模型正在下载或校验中，请稍后再试。")
-
-        try:
-            status_payload = self.get_ocr_model_status_payload()
-            if not status_payload["dependenciesReady"]:
-                raise RuntimeError(status_payload["message"])
-            if not status_payload["cacheWritable"]:
-                raise RuntimeError(status_payload["message"])
-            if status_payload["ready"]:
-                status_payload["downloaded"] = False
-                status_payload["message"] = "OCR 模型已就绪，无需重复下载。"
-                return status_payload
-
-            self._get_paddle_ocr_engine()
-            refreshed = self.get_ocr_model_status_payload()
-            refreshed["downloaded"] = True
-            if not refreshed["ready"]:
-                raise RuntimeError(refreshed["message"] or "OCR 模型下载后校验失败。")
-            refreshed["message"] = "OCR 模型已下载并完成校验。"
-            return refreshed
-        finally:
-            self._paddle_ocr_download_lock.release()
-
-    def collect_ocr_dependency_items(self) -> list[dict[str, Any]]:
-        self.configure_paddle_runtime_env()
-        items: list[dict[str, Any]] = []
-        for module_name, package_name in (
-            ("paddleocr", "paddleocr"),
-            ("paddle", "paddlepaddle"),
-            ("paddlex", "paddlex"),
-        ):
-            items.append(
-                self.inspect_ocr_dependency_item(module_name, package_name)
-            )
-        return items
-
-    def inspect_ocr_dependency_item(
-        self,
-        module_name: str,
-        package_name: str,
-    ) -> dict[str, Any]:
-        try:
-            importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:
-            missing_name = str(getattr(exc, "name", "") or "").strip()
-            installed = bool(missing_name) and missing_name != module_name
-            if installed:
-                error_message = f"缺少依赖模块: {missing_name}"
-            else:
-                error_message = f"未找到模块: {module_name}"
-            return {
-                "module": module_name,
-                "package": package_name,
-                "installed": installed,
-                "importable": False,
-                "errorMessage": error_message,
-            }
-        except Exception as exc:
-            return {
-                "module": module_name,
-                "package": package_name,
-                "installed": True,
-                "importable": False,
-                "errorMessage": str(exc).strip() or exc.__class__.__name__,
-            }
-
-        return {
-            "module": module_name,
-            "package": package_name,
-            "installed": True,
-            "importable": True,
-            "errorMessage": "",
-        }
-
-    def configure_paddle_runtime_env(self) -> Path:
-        cache_dir = self.resolve_paddle_cache_home()
-        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_dir))
-        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-        return cache_dir
-
-    def check_directory_writable(self, directory: Path) -> tuple[bool, str]:
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-            probe_path = directory / ".write-probe"
-            probe_path.write_text("ok", encoding="utf-8")
-            probe_path.unlink(missing_ok=True)
-            return True, "缓存目录可写"
-        except Exception as exc:
-            return False, f"缓存目录不可写: {exc}"
-
-    def collect_ocr_model_artifact_summary(self, cache_dir: Path) -> dict[str, Any]:
-        artifact_files: list[Path] = []
-        artifact_directories: set[str] = set()
-        cache_size_bytes = 0
-        if cache_dir.exists():
-            for candidate in cache_dir.rglob("*"):
-                if not candidate.is_file():
-                    continue
-                try:
-                    cache_size_bytes += candidate.stat().st_size
-                except OSError:
-                    pass
-                if not self.is_ocr_model_signature_file(candidate):
-                    continue
-                artifact_files.append(candidate)
-                try:
-                    relative_parent = candidate.parent.relative_to(cache_dir)
-                    artifact_directories.add(str(relative_parent))
-                except ValueError:
-                    artifact_directories.add(str(candidate.parent))
-
-        sample_files: list[str] = []
-        for path in artifact_files[:6]:
-            try:
-                sample_files.append(str(path.relative_to(cache_dir)))
-            except ValueError:
-                sample_files.append(str(path))
-
-        return {
-            "artifactFileCount": len(artifact_files),
-            "artifactDirectoryCount": len(artifact_directories),
-            "cacheSizeBytes": cache_size_bytes,
-            "sampleFiles": sample_files,
-        }
-
-    def is_ocr_model_signature_file(self, path: Path) -> bool:
-        suffix = path.suffix.lower()
-        if suffix in OCR_MODEL_SIGNATURE_SUFFIXES:
-            return True
-        return path.name.lower() in OCR_MODEL_SIGNATURE_FILENAMES
-
-    def resolve_ocr_model_ready_marker_path(self) -> Path:
-        return self.resolve_paddle_cache_home() / OCR_MODEL_READY_MARKER_FILENAME
-
-    def load_ocr_model_ready_marker(self) -> dict[str, Any] | None:
-        marker_path = self.resolve_ocr_model_ready_marker_path()
-        if not marker_path.exists() or not marker_path.is_file():
-            return None
-        try:
-            payload = json.loads(marker_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    def persist_ocr_model_ready_marker(self) -> dict[str, Any]:
-        cache_dir = self.resolve_paddle_cache_home()
-        artifact_summary = self.collect_ocr_model_artifact_summary(cache_dir)
-        payload = {
-            "engine": OCR_ENGINE_NAME,
-            "verifiedAt": now_local().isoformat(sep=" ", timespec="seconds"),
-            "cacheDir": str(cache_dir),
-            "artifactFileCount": artifact_summary["artifactFileCount"],
-            "artifactDirectoryCount": artifact_summary["artifactDirectoryCount"],
-            "cacheSizeBytes": artifact_summary["cacheSizeBytes"],
-        }
-        marker_path = self.resolve_ocr_model_ready_marker_path()
-        marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return payload
-
-    def _get_paddle_ocr_engine(self) -> Any:
-        if self._paddle_ocr_engine is not None:
-            return self._paddle_ocr_engine
-
-        with self._paddle_ocr_lock:
-            if self._paddle_ocr_engine is not None:
-                return self._paddle_ocr_engine
-            self._paddle_ocr_engine = self._create_paddle_ocr_engine()
-            self.persist_ocr_model_ready_marker()
-            return self._paddle_ocr_engine
-
-    def _create_paddle_ocr_engine(self) -> Any:
-        self.configure_paddle_runtime_env()
-        try:
-            from paddleocr import PaddleOCR
-        except Exception as exc:
-            raise RuntimeError(
-                "未安装 PaddleOCR 运行依赖，请先安装 `paddleocr`，并按官方文档安装 PaddlePaddle。"
-            ) from exc
-
-        init_attempts = self._build_paddle_ocr_init_attempts(PaddleOCR)
-        last_error: Exception | None = None
-        for kwargs in init_attempts:
-            try:
-                return PaddleOCR(**kwargs)
-            except Exception as exc:
-                if not self._is_retryable_paddle_ocr_init_error(exc):
-                    raise RuntimeError(self._format_paddle_ocr_init_error(exc)) from exc
-                last_error = exc
-                continue
-
-        raise RuntimeError(self._format_paddle_ocr_init_error(last_error))
-
-    def _build_paddle_ocr_init_attempts(
-        self,
-        paddle_ocr_class: Any,
-    ) -> tuple[dict[str, Any], ...]:
-        supported_params = self._get_paddle_ocr_supported_params(paddle_ocr_class)
-        attempts: list[dict[str, Any]] = []
-
-        def add_attempt(**kwargs: Any) -> None:
-            attempt = kwargs
-            if supported_params is not None:
-                attempt = {
-                    key: value
-                    for key, value in kwargs.items()
-                    if key in supported_params
-                }
-            if attempt not in attempts:
-                attempts.append(attempt)
-
-        # PaddleOCR 3.x 默认会拉起文档预处理与方向分类模型；调试台只需要纯 OCR。
-        add_attempt(
-            lang="ch",
-            show_log=False,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            use_angle_cls=False,
-        )
-        add_attempt(
-            lang="ch",
-            show_log=False,
-            use_angle_cls=False,
-        )
-        add_attempt(lang="ch", show_log=False)
-        add_attempt(lang="ch")
-        add_attempt()
-        return tuple(attempts)
-
-    def _get_paddle_ocr_supported_params(
-        self,
-        paddle_ocr_class: Any,
-    ) -> set[str] | None:
-        try:
-            signature = inspect.signature(paddle_ocr_class)
-        except (TypeError, ValueError):
-            return None
-
-        return {
-            name
-            for name, parameter in signature.parameters.items()
-            if parameter.kind
-            in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-        }
-
-    def _is_retryable_paddle_ocr_init_error(self, error: Exception) -> bool:
-        if isinstance(error, TypeError):
-            return True
-
-        message = str(error or "").strip().lower()
-        if not message:
-            return False
-
-        retryable_fragments = (
-            "unknown argument",
-            "unexpected keyword argument",
-            "got an unexpected keyword argument",
-            "invalid keyword argument",
-        )
-        return any(fragment in message for fragment in retryable_fragments)
-
-    def _format_paddle_ocr_init_error(self, error: Exception | None) -> str:
-        if error is None:
-            return "PaddleOCR 初始化失败: 不支持当前初始化参数"
-
-        message = str(error).strip() or error.__class__.__name__
-        if self._looks_like_paddle_model_download_error(message):
-            return (
-                "PaddleOCR 初始化失败: 首次运行需要下载 OCR 模型，请确认当前网络可访问 "
-                "HuggingFace/AiStudio，或提前把模型缓存到 "
-                f"{self.resolve_paddle_cache_home()}。原始错误: {message}"
-            )
-        return f"PaddleOCR 初始化失败: {message}"
-
-    def _looks_like_paddle_model_download_error(self, message: str) -> bool:
-        normalized = str(message or "").strip().lower()
-        if not normalized:
-            return False
-
-        fragments = (
-            "huggingface",
-            "aistudio",
-            "model hoster",
-            "download model",
-            "failed to download",
-            "timed out",
-            "timeout",
-            "name or service not known",
-            "temporary failure in name resolution",
-            "connection reset",
-            "connection refused",
-            "proxyerror",
-            "ssl",
-        )
-        return any(fragment in normalized for fragment in fragments)
-
-    def ocr_remote_image_text(self, image_url: str) -> dict[str, Any]:
-        normalized_image_url = self.normalize_remote_image_url(image_url)
-        with tempfile.TemporaryDirectory(prefix="huasheng-cover-ocr-") as temp_dir:
-            target_path = Path(temp_dir) / (
-                f"cover{self.resolve_remote_image_suffix(normalized_image_url)}"
-            )
-            self._download_image_to_path(normalized_image_url, target_path)
-            payload = self.ocr_image_text(str(target_path))
-
-        payload["imageUrl"] = normalized_image_url
-        return payload
-
-    def normalize_remote_image_url(self, value: Any) -> str:
-        normalized = self.normalize_text_field(
-            value,
-            field_name="封面图片地址",
-            max_length=4000,
-        )
-        parsed = urlparse(normalized)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("封面图片地址无效，必须是 http/https 链接。")
-        return normalized
-
-    def resolve_remote_image_suffix(self, image_url: str) -> str:
-        suffix = Path(urlparse(str(image_url or "")).path).suffix.lower()
-        if suffix in SUPPORTED_IMAGE_SUFFIXES:
-            return suffix
-        return ".png"
-
-    def _download_image_to_path(self, image_url: str, target_path: Path) -> None:
-        request = Request(
-            image_url,
-            headers={
-                "Accept": "image/*,*/*;q=0.8",
-                "User-Agent": MODEL_REQUEST_USER_AGENT,
-            },
-            method="GET",
-        )
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        with urlopen(request, timeout=COVER_IMAGE_DOWNLOAD_TIMEOUT) as response:
-            with target_path.open("wb") as output_file:
-                while True:
-                    chunk = response.read(VIDEO_DOWNLOAD_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    output_file.write(chunk)
-
-        if not target_path.exists() or target_path.stat().st_size <= 0:
-            raise RuntimeError("封面图片下载失败: 响应内容为空。")
-
-    def _recognize_image_text_lines(self, engine: Any, image_path: Path) -> list[dict[str, Any]]:
-        normalized_path = str(image_path)
-        if hasattr(engine, "predict"):
-            try:
-                return self._extract_ocr_lines_from_predict_results(
-                    engine.predict(normalized_path)
-                )
-            except TypeError:
-                try:
-                    return self._extract_ocr_lines_from_predict_results(
-                        engine.predict(input=normalized_path)
-                    )
-                except TypeError:
-                    pass
-                except Exception as exc:
-                    raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
-            except Exception as exc:
-                raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
-
-        if hasattr(engine, "ocr"):
-            try:
-                return self._extract_ocr_lines_from_legacy_results(
-                    engine.ocr(normalized_path, cls=True)
-                )
-            except TypeError:
-                try:
-                    return self._extract_ocr_lines_from_legacy_results(engine.ocr(normalized_path))
-                except Exception as exc:
-                    raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
-            except Exception as exc:
-                raise RuntimeError(f"图片 OCR 识别失败: {exc}") from exc
-
-        raise RuntimeError("当前 PaddleOCR 版本没有可用的图片识别入口。")
-
-    def _extract_ocr_lines_from_predict_results(
-        self,
-        results: Any,
-    ) -> list[dict[str, Any]]:
-        normalized_lines: list[dict[str, Any]] = []
-        for item in list(results or []):
-            payload = self._normalize_paddle_predict_payload(item)
-            result_payload = payload.get("res") if isinstance(payload.get("res"), dict) else payload
-            texts = result_payload.get("rec_texts") or result_payload.get("texts") or []
-            scores = result_payload.get("rec_scores") or result_payload.get("scores") or []
-            boxes = (
-                result_payload.get("rec_boxes")
-                or result_payload.get("dt_polys")
-                or result_payload.get("rec_polys")
-                or result_payload.get("boxes")
-                or []
-            )
-            if isinstance(texts, str):
-                texts = [texts]
-
-            for index, text in enumerate(texts):
-                normalized_text = str(text or "").strip()
-                if not normalized_text:
-                    continue
-                normalized_lines.append(
-                    self._build_ocr_line_payload(
-                        text=normalized_text,
-                        score=scores[index] if index < len(scores) else None,
-                        box=boxes[index] if index < len(boxes) else None,
-                    )
-                )
-        return normalized_lines
-
-    def _extract_ocr_lines_from_legacy_results(
-        self,
-        results: Any,
-    ) -> list[dict[str, Any]]:
-        normalized_lines: list[dict[str, Any]] = []
-        for page in list(results or []):
-            for item in list(page or []):
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-                box = item[0]
-                raw_recognition = item[1]
-                text = ""
-                score: Any = None
-                if isinstance(raw_recognition, dict):
-                    text = str(
-                        raw_recognition.get("text")
-                        or raw_recognition.get("rec_text")
-                        or ""
-                    ).strip()
-                    score = raw_recognition.get("score") or raw_recognition.get("rec_score")
-                elif isinstance(raw_recognition, (list, tuple)):
-                    text = str(raw_recognition[0] if raw_recognition else "").strip()
-                    score = raw_recognition[1] if len(raw_recognition) > 1 else None
-                else:
-                    text = str(raw_recognition or "").strip()
-
-                if not text:
-                    continue
-                normalized_lines.append(
-                    self._build_ocr_line_payload(
-                        text=text,
-                        score=score,
-                        box=box,
-                    )
-                )
-        return normalized_lines
-
-    def _normalize_paddle_predict_payload(self, item: Any) -> dict[str, Any]:
-        payload = item
-        if hasattr(payload, "json"):
-            payload = getattr(payload, "json")
-
-        if callable(payload):
-            payload = payload()
-        elif hasattr(payload, "model_dump"):
-            payload = payload.model_dump()
-        elif hasattr(payload, "dict"):
-            payload = payload.dict()
-
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                return {}
-
-        return payload if isinstance(payload, dict) else {}
-
-    def _build_ocr_line_payload(
-        self,
-        *,
-        text: str,
-        score: Any = None,
-        box: Any = None,
-    ) -> dict[str, Any]:
-        normalized_score: float | None = None
-        if score not in (None, ""):
-            try:
-                normalized_score = round(float(score), 4)
-            except (TypeError, ValueError):
-                normalized_score = None
-        return {
-            "text": str(text or "").strip(),
-            "score": normalized_score,
-            "box": self._normalize_ocr_box(box),
-        }
-
-    def _normalize_ocr_box(self, value: Any) -> Any:
-        if value is None:
-            return None
-        if hasattr(value, "tolist"):
-            value = value.tolist()
-        if isinstance(value, tuple):
-            value = list(value)
-        if isinstance(value, list):
-            return [self._normalize_ocr_box(item) for item in value]
-        if isinstance(value, (int, float, str, bool)):
-            return value
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return str(value)
 
     def start_task_processor(self) -> None:
         with self._task_processor_state_lock:
@@ -2598,102 +1958,6 @@ class AccountService:
 
     def is_project_failed(self, payload: dict[str, Any] | None) -> bool:
         return bool(re.search(r"失败|异常|取消", self.build_project_state_text(payload)))
-
-    def is_project_website_link_check_enabled(self) -> bool:
-        settings = self.get_global_settings_payload()["settings"]
-        return bool(settings.get("checkWebsiteLinks"))
-
-    def find_project_cover_website_link_violation(
-        self,
-        payload: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        seen_urls: set[str] = set()
-        for cover_item in self.iter_project_clip_cover_urls(payload):
-            cover_url = cover_item["coverUrl"]
-            if cover_url in seen_urls:
-                continue
-            seen_urls.add(cover_url)
-            ocr_payload = self.ocr_remote_image_text(cover_url)
-            matched_link = self.extract_website_link_from_text(ocr_payload.get("text") or "")
-            if not matched_link:
-                continue
-            return {
-                "clipIndex": cover_item["clipIndex"],
-                "coverUrl": cover_url,
-                "matchedLink": matched_link,
-                "ocrText": str(ocr_payload.get("text") or ""),
-            }
-        return None
-
-    def iter_project_clip_cover_urls(
-        self,
-        payload: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        source = payload if isinstance(payload, dict) else {}
-        clips = source.get("clips")
-        if not isinstance(clips, list):
-            return []
-
-        items: list[dict[str, Any]] = []
-        for index, clip in enumerate(clips, start=1):
-            if not isinstance(clip, dict):
-                continue
-            clip_seen_urls: set[str] = set()
-            for candidate in (
-                clip.get("cover"),
-                self._extract_nested_cover_url(clip.get("video")),
-                self._extract_nested_cover_url(clip.get("composite_video")),
-                self._extract_nested_cover_url(clip.get("ppt_video")),
-            ):
-                normalized = str(candidate or "").strip()
-                if not normalized or normalized in clip_seen_urls:
-                    continue
-                clip_seen_urls.add(normalized)
-                items.append(
-                    {
-                        "clipIndex": index,
-                        "coverUrl": normalized,
-                    }
-                )
-            for candidate in list(clip.get("video_candidates") or []):
-                normalized = self._extract_nested_cover_url(candidate)
-                if not normalized or normalized in clip_seen_urls:
-                    continue
-                clip_seen_urls.add(normalized)
-                items.append(
-                    {
-                        "clipIndex": index,
-                        "coverUrl": normalized,
-                    }
-                )
-        return items
-
-    def _extract_nested_cover_url(self, payload: Any) -> str:
-        if not isinstance(payload, dict):
-            return ""
-        return str(payload.get("cover") or "").strip()
-
-    def extract_website_link_from_text(self, text: Any) -> str:
-        normalized = self.normalize_ocr_text_for_website_link_detection(text)
-        if not normalized:
-            return ""
-
-        candidates = [normalized]
-        compact = re.sub(r"\s+", "", normalized)
-        if compact and compact not in candidates:
-            candidates.append(compact)
-
-        for candidate in candidates:
-            match = WEBSITE_LINK_PATTERN.search(candidate)
-            if match:
-                return str(match.group(0) or "").strip().rstrip(".,;:!?)]}>")
-        return ""
-
-    def normalize_ocr_text_for_website_link_detection(self, text: Any) -> str:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return ""
-        return normalized.translate(WEBSITE_LINK_TEXT_TRANSLATION)
 
     def parse_export_progress(self, payload: dict[str, Any] | None) -> int:
         source = payload if isinstance(payload, dict) else {}
@@ -3631,10 +2895,6 @@ class AccountService:
             "downloadDir": self.normalize_download_directory(
                 settings.get("downloadDir")
             ),
-            "checkWebsiteLinks": self.normalize_boolean_flag(
-                settings.get("checkWebsiteLinks"),
-                default=bool(DEFAULT_GLOBAL_SETTINGS["checkWebsiteLinks"]),
-            ),
         }
 
     def normalize_thread_pool_size(self, value: Any) -> int:
@@ -3812,30 +3072,6 @@ class AccountService:
         if not normalized:
             raise ValueError(f"{field_name} 不能为空。")
         return normalized
-
-    def resolve_image_file_path(self, image_path: str) -> Path:
-        normalized = self.normalize_required_text_field(
-            image_path,
-            field_name="图片路径",
-            max_length=4000,
-        )
-        path = Path(normalized).expanduser()
-        try:
-            resolved_path = path.resolve()
-        except OSError as exc:
-            raise ValueError(f"图片路径无效: {exc}") from exc
-
-        if not resolved_path.exists() or not resolved_path.is_file():
-            raise ValueError("图片文件不存在，请重新选择。")
-        if resolved_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
-            allowed = "/".join(sorted(suffix.lstrip(".") for suffix in SUPPORTED_IMAGE_SUFFIXES))
-            raise ValueError(f"请选择支持的图片格式: {allowed}")
-        return resolved_path
-
-    def resolve_paddle_cache_home(self) -> Path:
-        cache_directory = self.db_path.parent / ".paddle-cache" / "paddlex"
-        cache_directory.mkdir(parents=True, exist_ok=True)
-        return cache_directory.resolve()
 
     def resolve_log_directory_path(self) -> Path:
         log_directory = resolve_log_directory_from_db_path(self.db_path)
@@ -4587,26 +3823,8 @@ class AccountService:
                 )
                 return
 
-            if self.is_project_website_link_check_enabled():
-                violation = self.find_project_cover_website_link_violation(project_payload)
-                if violation is not None:
-                    self.update_task_status(
-                        task_id,
-                        TASK_STATUS_EXPORT_FAILED,
-                        project_identifier,
-                        progress=100,
-                        huasheng_status=TASK_HUASHENG_STATUS_WEBSITE_LINK_BLOCKED,
-                    )
-                    logger.warning(
-                        "Task huasheng-project blocked by website-link audit task_id=%s clip_index=%s cover_url=%s matched_link=%s",
-                        task_id,
-                        violation["clipIndex"],
-                        violation["coverUrl"],
-                        violation["matchedLink"],
-                    )
-                    return
-
             subtitle_settings = self.load_subtitle_settings_snapshot()
+            voice_settings = self.load_huasheng_voice_settings_snapshot()
             self.update_task_status(
                 task_id,
                 TASK_STATUS_SUBTITLE_APPLYING,
@@ -4615,10 +3833,12 @@ class AccountService:
                 huasheng_status=project_state_text,
             )
             logger.info(
-                "Task huasheng-project finished task_id=%s applying subtitle font_size=%s style_id=%s",
+                "Task huasheng-project finished task_id=%s applying subtitle font_size=%s style_id=%s voice_id=%s speech_rate=%s",
                 task_id,
                 subtitle_settings["fontSize"],
                 subtitle_settings["styleId"],
+                voice_settings["voiceId"],
+                voice_settings["speechRate"],
             )
             self._huasheng.edit_project(
                 account_snapshot["cookies"],
@@ -4628,6 +3848,13 @@ class AccountService:
                 outline_color=subtitle_settings["outlineColor"],
                 outline_thick=subtitle_settings["outlineThick"],
             )
+            self._huasheng.edit_project_tts_settings(
+                account_snapshot["cookies"],
+                project_id=project_numeric_id,
+                voice_id=int(voice_settings["voiceId"]),
+                speech_rate=float(voice_settings["speechRate"]),
+            )
+            time.sleep(HUASHENG_PRE_EXPORT_EDIT_DELAY_SECONDS)
             export_payload = self._huasheng.export_project_video(
                 account_snapshot["cookies"],
                 project_id=project_numeric_id,
@@ -4934,3 +4161,4 @@ class AccountService:
             return normalized
 
         return f"Bearer {normalized}"
+

@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH).resolve()
@@ -32,14 +32,6 @@ if playwright_browser_dir:
         datas.append((str(browser_root), "playwright-browsers"))
 
 hiddenimports = collect_submodules("playwright")
-try:
-    for package_name in ("paddleocr", "paddle", "paddlex"):
-        package_datas, package_binaries, package_hiddenimports = collect_all(package_name)
-        datas += package_datas
-        binaries += package_binaries
-        hiddenimports += package_hiddenimports
-except Exception:
-    pass
 if sys.platform == "darwin":
     hiddenimports += [
         "webview.platforms.cocoa",
