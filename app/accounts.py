@@ -146,6 +146,17 @@ TITLE_OUTPUT_FORMAT_PROMPT = (
     "########title\n"
     "这里填写生成后的标题"
 )
+TITLE_RESPONSE_MAX_LENGTH = 80
+TITLE_RESPONSE_INVALID_PREFIXES = (
+    "你的这篇文章",
+    "这篇文章",
+    "整体上",
+    "核心优点",
+    "优点是",
+    "建议",
+    "点评",
+    "分析",
+)
 MODEL_CONNECTION_TEST_SYSTEM_PROMPT = "你是模型连接测试助手。请只返回“连接成功”四个字。"
 MODEL_CONNECTION_TEST_USER_CONTENT = "请返回连接成功。"
 TASK_QUEUE_SCAN_INTERVAL_SECONDS = 5
@@ -199,6 +210,10 @@ def now_local() -> datetime:
 
 
 class HuashengCreateRetryRequired(RuntimeError):
+    pass
+
+
+class NonRetryableTaskStageError(RuntimeError):
     pass
 
 
@@ -1322,6 +1337,7 @@ class AccountService:
         article: str,
         *,
         prompt_id: int | None = None,
+        task_id: int | None = None,
     ) -> dict[str, Any]:
         normalized_base_url = self.normalize_model_base_url(base_url)
         normalized_api_key = self.normalize_required_text_field(
@@ -1345,14 +1361,16 @@ class AccountService:
             max_length=100000,
         )
         rewrite_system_prompt = self.build_rewrite_system_prompt(normalized_prompt_content)
+        rewrite_user_content = self.build_rewrite_user_content(normalized_article)
         content = self._request_model_text(
             base_url=normalized_base_url,
             api_key=normalized_api_key,
             model=normalized_model,
             system_prompt=rewrite_system_prompt,
-            user_content=normalized_article,
+            user_content=rewrite_user_content,
             action_name="文章改写",
             timeout=REWRITE_MODEL_REQUEST_TIMEOUT,
+            task_id=task_id,
         )
         normalized_content = self.normalize_rewrite_response_text(content)
         if self.is_rewrite_redline_response(normalized_content or content):
@@ -1379,10 +1397,13 @@ class AccountService:
         }
 
     def build_rewrite_system_prompt(self, prompt_content: str) -> str:
-        normalized_prompt = str(prompt_content or "").rstrip()
-        if not normalized_prompt:
+        return str(prompt_content or "").strip()
+
+    def build_rewrite_user_content(self, article: str) -> str:
+        normalized_article = str(article or "").strip()
+        if not normalized_article:
             return REWRITE_OUTPUT_FORMAT_PROMPT
-        return f"{normalized_prompt}\n\n{REWRITE_OUTPUT_FORMAT_PROMPT}"
+        return f"{normalized_article}\n\n{REWRITE_OUTPUT_FORMAT_PROMPT}"
 
     def normalize_rewrite_response_text(self, text: str) -> str:
         normalized = self._strip_labeled_output(text, label="content")
@@ -1436,13 +1457,14 @@ class AccountService:
             max_length=100000,
         )
         title_system_prompt = self.build_title_system_prompt(normalized_title_prompt)
+        title_user_content = self.build_title_user_content(normalized_article)
 
         title = self._request_model_text(
             base_url=normalized_base_url,
             api_key=normalized_api_key,
             model=normalized_model,
             system_prompt=title_system_prompt,
-            user_content=normalized_article,
+            user_content=title_user_content,
             action_name="标题生成",
             timeout=TITLE_MODEL_REQUEST_TIMEOUT,
         )
@@ -1830,16 +1852,29 @@ class AccountService:
         )
 
     def build_title_system_prompt(self, title_prompt: str) -> str:
-        normalized_prompt = str(title_prompt or "").rstrip()
-        if not normalized_prompt:
+        return str(title_prompt or "").strip()
+
+    def build_title_user_content(self, article: str) -> str:
+        normalized_article = str(article or "").strip()
+        if not normalized_article:
             return TITLE_OUTPUT_FORMAT_PROMPT
-        return f"{normalized_prompt}\n\n{TITLE_OUTPUT_FORMAT_PROMPT}"
+        return f"{normalized_article}\n\n{TITLE_OUTPUT_FORMAT_PROMPT}"
 
     def normalize_title_response_text(self, text: str) -> str:
-        normalized = self._strip_labeled_output(text, label="title")
+        normalized = self._strip_markdown_code_fence(
+            self._strip_labeled_output(text, label="title")
+        )
         for line in normalized.splitlines():
             stripped = line.strip()
             if stripped:
+                if len(stripped) > TITLE_RESPONSE_MAX_LENGTH:
+                    raise RuntimeError(
+                        "标题生成失败: 模型返回内容不符合格式，只接受单行短标题。"
+                    )
+                if any(stripped.startswith(prefix) for prefix in TITLE_RESPONSE_INVALID_PREFIXES):
+                    raise RuntimeError(
+                        "标题生成失败: 模型返回内容不符合格式，只接受单行短标题。"
+                    )
                 return stripped
         return ""
 
@@ -3321,6 +3356,13 @@ class AccountService:
         self._unmark_task_inflight(task_id, stage=stage)
         exception = future.exception()
         if exception is not None:
+            if self._should_suppress_worker_failure_warning(stage=stage, error=exception):
+                logger.debug(
+                    "Task processor worker failure already logged task_id=%s stage=%s",
+                    task_id,
+                    stage,
+                )
+                return
             logger.warning(
                 "Task processor worker failed task_id=%s stage=%s error=%s",
                 task_id,
@@ -3338,6 +3380,19 @@ class AccountService:
     def _is_missing_task_error(self, error: Exception) -> bool:
         return isinstance(error, ValueError) and "任务不存在" in str(error)
 
+    def _should_suppress_worker_failure_warning(self, *, stage: str, error: BaseException) -> bool:
+        handled_stages = {
+            TASK_STAGE_REWRITE,
+            TASK_STAGE_TITLE,
+            TASK_STAGE_HUASHENG_CREATE,
+            TASK_STAGE_HUASHENG_PROGRESS,
+        }
+        return (
+            stage in handled_stages
+            and isinstance(error, RuntimeError)
+            and getattr(error, "__cause__", None) is not None
+        )
+
     def _run_stage_with_auto_retries(
         self,
         task_id: int,
@@ -3351,6 +3406,8 @@ class AccountService:
                 runner()
                 return
             except HuashengCreateRetryRequired:
+                raise
+            except NonRetryableTaskStageError:
                 raise
             except Exception as exc:
                 if self._is_missing_task_error(exc) or attempt >= total_attempts:
@@ -3393,6 +3450,7 @@ class AccountService:
                 prompt_content,
                 article_text,
                 prompt_id=task.rewrite_prompt_id,
+                task_id=task_id,
             )
             if payload.get("triggeredRedline"):
                 try:
@@ -3444,9 +3502,16 @@ class AccountService:
                 logger.info("Task rewrite stopped because task was deleted task_id=%s", task_id)
                 return
 
-            logger.exception("Task rewrite failed task_id=%s error=%s", task_id, exc)
+            if isinstance(exc, NonRetryableTaskStageError):
+                logger.warning("Task rewrite failed task_id=%s error=%s", task_id, exc)
+            else:
+                logger.exception("Task rewrite failed task_id=%s error=%s", task_id, exc)
             try:
-                self.update_task_status(task_id, TASK_STATUS_REWRITE_FAILED)
+                self.update_task_status(
+                    task_id,
+                    TASK_STATUS_REWRITE_FAILED,
+                    huasheng_status=self._build_task_failure_detail(exc),
+                )
             except Exception as status_error:
                 if self._is_missing_task_error(status_error):
                     logger.info(
@@ -3517,9 +3582,16 @@ class AccountService:
                 logger.info("Task title stopped because task was deleted task_id=%s", task_id)
                 return
 
-            logger.exception("Task title generation failed task_id=%s error=%s", task_id, exc)
+            if isinstance(exc, NonRetryableTaskStageError):
+                logger.warning("Task title generation failed task_id=%s error=%s", task_id, exc)
+            else:
+                logger.exception("Task title generation failed task_id=%s error=%s", task_id, exc)
             try:
-                self.update_task_status(task_id, TASK_STATUS_TITLE_FAILED)
+                self.update_task_status(
+                    task_id,
+                    TASK_STATUS_TITLE_FAILED,
+                    huasheng_status=self._build_task_failure_detail(exc),
+                )
             except Exception as status_error:
                 if self._is_missing_task_error(status_error):
                     logger.info(
@@ -3952,6 +4024,7 @@ class AccountService:
         user_content: str,
         action_name: str,
         timeout: float = MODEL_REQUEST_TIMEOUT,
+        task_id: int | None = None,
     ) -> str:
         payload = {
             "model": model,
@@ -3971,48 +4044,156 @@ class AccountService:
             },
             method="POST",
         )
+        task_log_value = int(task_id) if int(task_id or 0) > 0 else "-"
         logger.info(
-            "%s request url=%s model=%s timeout_seconds=%.1f system_prompt_length=%s article_length=%s",
+            "%s request task_id=%s url=%s model=%s timeout_seconds=%.1f system_prompt_length=%s article_length=%s",
             action_name,
+            task_log_value,
             base_url,
             model,
             timeout,
             len(system_prompt),
             len(user_content),
         )
+        if self._should_log_model_request_payload(action_name):
+            logger.info(
+                "%s request payload task_id=%s url=%s system_prompt=%s user_content=%s",
+                action_name,
+                task_log_value,
+                base_url,
+                self._summarize_model_text(system_prompt, limit=5000),
+                self._summarize_model_text(user_content, limit=5000),
+            )
+        start_time = time.perf_counter()
+        response_status: int | None = None
         try:
             with urlopen(request, timeout=timeout) as response:
+                response_status = getattr(response, "status", None)
                 raw_body = response.read()
         except HTTPError as exc:
+            duration_ms = (time.perf_counter() - start_time) * 1000
             error_body = exc.read()
             error_message = self._extract_model_error_message(
                 error_body,
                 fallback=f"HTTP {exc.code} {exc.reason}",
             )
             logger.warning(
-                "%s request failed url=%s status=%s reason=%s message=%s",
+                "%s request failed task_id=%s url=%s status=%s reason=%s duration_ms=%.1f body_bytes=%s message=%s response_preview=%s",
                 action_name,
+                task_log_value,
                 base_url,
                 exc.code,
                 exc.reason,
+                duration_ms,
+                len(error_body),
                 error_message,
+                self._summarize_model_raw_text(error_body),
             )
             raise RuntimeError(
                 f"{action_name}失败: {error_message}"
             ) from exc
         except URLError as exc:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            logger.warning(
+                "%s request failed task_id=%s url=%s reason=%s duration_ms=%.1f",
+                action_name,
+                task_log_value,
+                base_url,
+                exc.reason,
+                duration_ms,
+            )
             raise RuntimeError(f"{action_name}失败: {exc.reason}") from exc
         except OSError as exc:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            logger.warning(
+                "%s request failed task_id=%s url=%s reason=%s duration_ms=%.1f",
+                action_name,
+                task_log_value,
+                base_url,
+                exc,
+                duration_ms,
+            )
             raise RuntimeError(f"{action_name}失败: {exc}") from exc
 
+        duration_ms = (time.perf_counter() - start_time) * 1000
         try:
             response_payload = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "%s response decode failed task_id=%s url=%s status=%s duration_ms=%.1f body_bytes=%s response_preview=%s",
+                action_name,
+                task_log_value,
+                base_url,
+                response_status,
+                duration_ms,
+                len(raw_body),
+                self._summarize_model_raw_text(raw_body),
+            )
             raise RuntimeError(f"{action_name}失败: 模型接口返回不是有效 JSON。") from exc
 
-        text = self._extract_model_response_text(response_payload)
+        response_summary = self._describe_model_response_payload(response_payload)
+        logger.info(
+            "%s response received task_id=%s url=%s status=%s duration_ms=%.1f body_bytes=%s summary=%s",
+            action_name,
+            task_log_value,
+            base_url,
+            response_status,
+            duration_ms,
+            len(raw_body),
+            response_summary,
+        )
+        if self._should_log_model_response_payload(action_name):
+            logger.info(
+                "%s response payload task_id=%s url=%s payload=%s",
+                action_name,
+                task_log_value,
+                base_url,
+                self._summarize_model_payload(response_payload, limit=5000),
+            )
+
+        try:
+            text = self._extract_model_response_text(response_payload)
+        except RuntimeError as exc:
+            nonretryable_error = self._detect_nonretryable_model_response_error(
+                response_payload,
+                action_name=action_name,
+            )
+            translated_error: RuntimeError = nonretryable_error or exc
+            logger.warning(
+                "%s response parse failed task_id=%s url=%s status=%s duration_ms=%.1f reason=%s summary=%s payload=%s",
+                action_name,
+                task_log_value,
+                base_url,
+                response_status,
+                duration_ms,
+                translated_error,
+                response_summary,
+                self._summarize_model_payload(response_payload, limit=5000),
+            )
+            if nonretryable_error is not None:
+                raise nonretryable_error from exc
+            raise RuntimeError(f"{action_name}失败: {exc} ({response_summary})") from exc
         if not text:
-            raise RuntimeError(f"{action_name}失败: 模型接口返回为空。")
+            logger.warning(
+                "%s response empty task_id=%s url=%s status=%s duration_ms=%.1f summary=%s payload=%s",
+                action_name,
+                task_log_value,
+                base_url,
+                response_status,
+                duration_ms,
+                response_summary,
+                self._summarize_model_payload(response_payload, limit=5000),
+            )
+            raise RuntimeError(f"{action_name}失败: 模型接口返回为空。({response_summary})")
+        if self._should_log_model_response_payload(action_name):
+            logger.info(
+                "%s response text task_id=%s url=%s text_length=%s text_preview=%s",
+                action_name,
+                task_log_value,
+                base_url,
+                len(text),
+                self._summarize_model_text(text, limit=3000),
+            )
         return text
 
     def _extract_model_response_text(self, payload: Any) -> str:
@@ -4071,6 +4252,188 @@ class AccountService:
             return "\n".join(parts).strip()
 
         return ""
+
+    def _describe_model_response_payload(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return f"type={type(payload).__name__}"
+
+        parts: list[str] = []
+        keys = sorted(str(key) for key in payload.keys())
+        parts.append(f"keys={','.join(keys[:10]) or '-'}")
+
+        response_id = str(payload.get("id") or "").strip()
+        if response_id:
+            parts.append(f"id={response_id[:80]}")
+
+        model_name = str(payload.get("model") or "").strip()
+        if model_name:
+            parts.append(f"model={model_name[:80]}")
+
+        if "output_text" in payload:
+            parts.append(
+                f"output_text={self._describe_model_value_shape(payload.get('output_text'))}"
+            )
+
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+            if prompt_tokens is not None:
+                parts.append(f"prompt_tokens={prompt_tokens}")
+            if completion_tokens is not None:
+                parts.append(f"completion_tokens={completion_tokens}")
+            if total_tokens is not None:
+                parts.append(f"total_tokens={total_tokens}")
+
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            parts.append(f"choices={len(choices)}")
+            if choices:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    choice_keys = sorted(str(key) for key in first_choice.keys())
+                    parts.append(f"choice_keys={','.join(choice_keys[:10]) or '-'}")
+
+                    finish_reason = str(first_choice.get("finish_reason") or "").strip()
+                    if finish_reason:
+                        parts.append(f"finish_reason={finish_reason}")
+
+                    message = first_choice.get("message")
+                    if isinstance(message, dict):
+                        message_keys = sorted(str(key) for key in message.keys())
+                        parts.append(f"message_keys={','.join(message_keys[:10]) or '-'}")
+                        parts.append(
+                            f"message_content={self._describe_model_value_shape(message.get('content'))}"
+                        )
+                    elif message is not None:
+                        parts.append(f"message_type={type(message).__name__}")
+
+                    if "text" in first_choice:
+                        parts.append(
+                            f"text={self._describe_model_value_shape(first_choice.get('text'))}"
+                        )
+                else:
+                    parts.append(f"choice0_type={type(first_choice).__name__}")
+        elif choices is not None:
+            parts.append(f"choices_type={type(choices).__name__}")
+
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            parts.append(f"message_length={len(message.strip())}")
+
+        return " ".join(parts)
+
+    def _describe_model_value_shape(self, value: Any) -> str:
+        if value is None:
+            return "none"
+        if isinstance(value, str):
+            return f"str[{len(value.strip())}]"
+        if isinstance(value, list):
+            text_items = sum(1 for item in value if isinstance(item, str) and item.strip())
+            dict_items = sum(1 for item in value if isinstance(item, dict))
+            return f"list[{len(value)}] text_items={text_items} dict_items={dict_items}"
+        if isinstance(value, dict):
+            keys = sorted(str(key) for key in value.keys())
+            return f"dict[{','.join(keys[:6]) or '-'}]"
+        return type(value).__name__
+
+    def _summarize_model_payload(self, payload: Any, *, limit: int = 1500) -> str:
+        try:
+            if isinstance(payload, (dict, list)):
+                text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            else:
+                text = str(payload)
+        except (TypeError, ValueError):
+            text = repr(payload)
+        text = " ".join(text.split())
+        if not text:
+            return "-"
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    def _summarize_model_raw_text(self, raw_body: bytes, *, limit: int = 1200) -> str:
+        text = raw_body.decode("utf-8", errors="replace")
+        text = " ".join(text.split())
+        if not text:
+            return "-"
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    def _summarize_model_text(self, text: str, *, limit: int = 3000) -> str:
+        normalized = " ".join(str(text or "").split()).strip()
+        if not normalized:
+            return "-"
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[:limit]}..."
+
+    def _should_log_model_request_payload(self, action_name: str) -> bool:
+        return str(action_name or "").strip() == "模型连接测试"
+
+    def _should_log_model_response_payload(self, action_name: str) -> bool:
+        return str(action_name or "").strip() in {"文章改写", "模型连接测试"}
+
+    def _detect_nonretryable_model_response_error(
+        self,
+        payload: Any,
+        *,
+        action_name: str,
+    ) -> NonRetryableTaskStageError | None:
+        if not isinstance(payload, dict):
+            return None
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            return None
+
+        finish_reason = str(first_choice.get("finish_reason") or "").strip().lower()
+        if finish_reason != "stop":
+            return None
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            return None
+
+        if self._normalize_model_text_content(message.get("content")):
+            return None
+        if self._normalize_model_text_content(first_choice.get("text")):
+            return None
+        if self._normalize_model_text_content(payload.get("output_text")):
+            return None
+
+        if action_name == "文章改写":
+            return NonRetryableTaskStageError(
+                "模型网关兼容异常：finish_reason=stop，但未返回正文内容。"
+            )
+        return NonRetryableTaskStageError(
+            "模型网关兼容异常：finish_reason=stop，但未返回文本内容。"
+        )
+
+    def _build_task_failure_detail(self, error: Exception, *, limit: int = 120) -> str:
+        text = str(error or "").strip()
+        if not text:
+            return "任务失败"
+
+        for prefix in ("文章改写失败:", "标题生成失败:"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                break
+
+        summary_marker = " (keys="
+        if summary_marker in text:
+            text = text.split(summary_marker, 1)[0].strip()
+
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
 
     def _extract_model_error_message(self, raw_body: bytes, *, fallback: str) -> str:
         try:
@@ -4161,4 +4524,3 @@ class AccountService:
             return normalized
 
         return f"Bearer {normalized}"
-

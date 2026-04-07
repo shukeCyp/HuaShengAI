@@ -525,7 +525,7 @@ html, body {
 .task-table {
   display: flex;
   flex-direction: column;
-  min-width: 760px;
+  min-width: 880px;
 }
 
 .task-table-head,
@@ -619,8 +619,20 @@ html, body {
 }
 
 .task-retry-button,
-.task-download-button {
+.task-download-button,
+.task-delete-button {
   min-width: 84px;
+}
+
+.task-delete-button {
+  border-color: rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.08);
+  color: #b42318;
+}
+
+.task-delete-button:hover:not(:disabled) {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.14);
 }
 
 .task-download-placeholder {

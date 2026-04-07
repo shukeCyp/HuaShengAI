@@ -78,6 +78,30 @@ class AppApiModelActionTests(unittest.TestCase):
         self.assertEqual(payload["responseText"], "连接成功")
         self.assertEqual(payload["requestUrl"], "https://api.example.com/v1/chat/completions")
 
+    def test_test_model_connection_logs_full_failure_context(self) -> None:
+        with (
+            patch.object(
+                self.service,
+                "test_model_connection",
+                side_effect=RuntimeError("模型网关兼容异常：finish_reason=stop，但未返回文本内容。"),
+            ),
+            self.assertLogs("app.bridge", level="INFO") as captured_logs,
+        ):
+            payload = self.api.test_model_connection(
+                "https://cpa.lyvideo.top/v1",
+                "secret-token",
+                "gpt-5.4",
+            )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["errorMessage"], "模型网关兼容异常：finish_reason=stop，但未返回文本内容。")
+        merged_logs = "\n".join(captured_logs.output)
+        self.assertIn("AppApi.test_model_connection called base_url=https://cpa.lyvideo.top/v1", merged_logs)
+        self.assertIn(
+            "AppApi.test_model_connection failed base_url=https://cpa.lyvideo.top/v1 model=gpt-5.4 error=模型网关兼容异常：finish_reason=stop，但未返回文本内容。",
+            merged_logs,
+        )
+
     def test_get_log_status_delegates_to_service(self) -> None:
         with patch.object(
             self.service,
@@ -172,6 +196,34 @@ class AppApiModelActionTests(unittest.TestCase):
         mocked_download.assert_called_once_with(8)
         self.assertEqual(payload["taskId"], 8)
         self.assertEqual(payload["downloadPath"], "/tmp/demo.mp4")
+
+    def test_start_download_task_video_publishes_started_event(self) -> None:
+        with (
+            patch.object(self.bridge, "publish_event") as mocked_publish,
+            patch("app.bridge.Thread") as mocked_thread,
+        ):
+            payload = self.api.start_download_task_video(8)
+
+        mocked_publish.assert_called_once()
+        mocked_thread.assert_called_once()
+        self.assertTrue(payload["started"])
+        self.assertFalse(payload["alreadyRunning"])
+        self.assertEqual(payload["taskId"], 8)
+
+    def test_delete_task_record_delegates_to_service(self) -> None:
+        with patch.object(
+            self.service,
+            "delete_task_record",
+            return_value={
+                "deletedCount": 1,
+                "taskId": 9,
+            },
+        ) as mocked_delete:
+            payload = self.api.delete_task_record(9)
+
+        mocked_delete.assert_called_once_with(9)
+        self.assertEqual(payload["deletedCount"], 1)
+        self.assertEqual(payload["taskId"], 9)
 
     def test_retry_task_record_delegates_to_service(self) -> None:
         with patch.object(

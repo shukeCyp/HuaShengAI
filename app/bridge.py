@@ -7,7 +7,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Callable
 
 import webview
@@ -263,6 +263,8 @@ class AppApi:
         self._account_service = account_service
         self._huasheng = huasheng or HuaShengAutomation()
         self._microheadline = microheadline or MicroHeadlineService(account_service.db_path)
+        self._download_task_ids_lock = Lock()
+        self._download_task_ids_inflight: set[int] = set()
 
     def ping(self) -> dict[str, Any]:
         response = {
@@ -299,6 +301,10 @@ class AppApi:
         logger.info("AppApi.delete_all_task_records called")
         return self._account_service.delete_all_task_records()
 
+    def delete_task_record(self, task_id: int) -> dict[str, Any]:
+        logger.info("AppApi.delete_task_record called task_id=%s", task_id)
+        return self._account_service.delete_task_record(task_id)
+
     def retry_task_record(self, task_id: int) -> dict[str, Any]:
         logger.info("AppApi.retry_task_record called task_id=%s", task_id)
         return self._account_service.retry_task_record(task_id)
@@ -306,6 +312,66 @@ class AppApi:
     def download_task_video(self, task_id: int) -> dict[str, Any]:
         logger.info("AppApi.download_task_video called task_id=%s", task_id)
         return self._account_service.download_task_video(task_id)
+
+    def start_download_task_video(self, task_id: int) -> dict[str, Any]:
+        normalized_task_id = self._account_service.normalize_positive_int(
+            task_id,
+            field_name="task_id",
+        )
+        logger.info("AppApi.start_download_task_video called task_id=%s", normalized_task_id)
+
+        with self._download_task_ids_lock:
+            if normalized_task_id in self._download_task_ids_inflight:
+                return {
+                    "taskId": normalized_task_id,
+                    "started": False,
+                    "alreadyRunning": True,
+                    "databasePath": str(self._account_service.db_path),
+                }
+            self._download_task_ids_inflight.add(normalized_task_id)
+
+        self._bridge.publish_event(
+            "tasks.download.started",
+            {
+                "taskId": normalized_task_id,
+                "databasePath": str(self._account_service.db_path),
+            },
+        )
+        Thread(
+            target=self._run_task_video_download_worker,
+            args=(normalized_task_id,),
+            name=f"task-video-download-{normalized_task_id}",
+            daemon=True,
+        ).start()
+        return {
+            "taskId": normalized_task_id,
+            "started": True,
+            "alreadyRunning": False,
+            "databasePath": str(self._account_service.db_path),
+        }
+
+    def _run_task_video_download_worker(self, task_id: int) -> None:
+        try:
+            payload = self._account_service.download_task_video(task_id)
+        except Exception as exc:
+            logger.warning(
+                "AppApi.start_download_task_video worker failed task_id=%s error=%s",
+                task_id,
+                exc,
+            )
+            self._bridge.publish_event(
+                "tasks.download.failed",
+                {
+                    "taskId": task_id,
+                    "errorMessage": str(exc),
+                    "databasePath": str(self._account_service.db_path),
+                },
+            )
+        else:
+            self._bridge.publish_event("tasks.download.finished", payload)
+        finally:
+            with self._download_task_ids_lock:
+                self._download_task_ids_inflight.discard(task_id)
 
 
     def create_task_record(
@@ -487,7 +553,13 @@ class AppApi:
             payload = runner()
         except Exception as exc:
             message = str(exc).strip() or f"{action_name}失败"
-            logger.warning("AppApi.%s failed: %s", action_name, message)
+            logger.warning(
+                "AppApi.%s failed base_url=%s model=%s error=%s",
+                action_name,
+                str(base_url or ""),
+                str(model or ""),
+                message,
+            )
             result = {
                 "success": False,
                 "errorMessage": message,
@@ -571,14 +643,16 @@ class AppApi:
         api_key: str,
         model: str,
     ) -> dict[str, Any]:
-        logger.info(
-            "AppApi.test_model_connection called base_url_length=%s api_key_length=%s model_length=%s",
-            len(str(base_url or "")),
-            len(str(api_key or "")),
-            len(str(model or "")),
-        )
         normalized_base_url = str(base_url or "")
         normalized_model = str(model or "")
+        logger.info(
+            "AppApi.test_model_connection called base_url=%s base_url_length=%s api_key_length=%s model=%s model_length=%s",
+            normalized_base_url,
+            len(normalized_base_url),
+            len(str(api_key or "")),
+            normalized_model,
+            len(normalized_model),
+        )
         return self._run_model_action(
             action_name="test_model_connection",
             base_url=normalized_base_url,

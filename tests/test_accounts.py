@@ -3,11 +3,12 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from urllib.error import URLError
 from unittest.mock import patch
 
-from app.accounts import AccountService
+from app.accounts import AccountService, NonRetryableTaskStageError
 from app.database import close_database, database, init_database
 from app.models import (
     BenchmarkAccount,
@@ -18,9 +19,10 @@ from app.models import (
 
 
 class FakeResponse:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, *, status: int = 200) -> None:
         self._payload = payload
         self._cursor = 0
+        self.status = status
 
     def read(self, size: int = -1) -> bytes:
         if size is None or size < 0:
@@ -322,24 +324,108 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 1200.0)
         self.assertEqual(captured["headers"]["Authorization"], "Bearer secret-token")
         self.assertEqual(captured["body"]["model"], "gpt-5.4")
-        self.assertTrue(
-            captured["body"]["messages"][0]["content"].startswith(
-                "把文章改写成更自然、更流畅的版本。"
-            )
+        self.assertEqual(
+            captured["body"]["messages"][0]["content"],
+            "把文章改写成更自然、更流畅的版本。",
         )
+        self.assertTrue(captured["body"]["messages"][1]["content"].startswith("原始文章内容"))
         self.assertIn(
             "只返回改写后的正文内容",
-            captured["body"]["messages"][0]["content"],
+            captured["body"]["messages"][1]["content"],
         )
         self.assertIn(
             "############content",
-            captured["body"]["messages"][0]["content"],
+            captured["body"]["messages"][1]["content"],
         )
-        self.assertEqual(captured["body"]["messages"][1]["content"], "原始文章内容")
         self.assertEqual(captured["headers"]["Accept"], "application/json")
         self.assertIn("Chrome/146.0.0.0", captured["headers"]["User-agent"])
         self.assertEqual(result["content"], "这是改写后的文章内容。")
         self.assertEqual(result["promptId"], prompt_id)
+
+    def test_rewrite_article_logs_payload_and_text_preview_on_success(self) -> None:
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "请改写。",
+            [
+                "请把文章改写得更流畅。",
+            ],
+        )
+        prompt_id = settings["prompts"][0]["id"]
+        sample_payload = {
+            "id": "chatcmpl-success",
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "message": {
+                        "content": "############content\n这是改写成功后的正文内容。"
+                    }
+                }
+            ],
+        }
+
+        with (
+            patch(
+                "app.accounts.urlopen",
+                return_value=FakeResponse(
+                    json.dumps(sample_payload, ensure_ascii=False).encode("utf-8"),
+                    status=200,
+                ),
+            ),
+            self.assertLogs("app.accounts", level="INFO") as captured_logs,
+        ):
+            result = self.service.rewrite_article(
+                "https://api.example.com/v1",
+                "secret-token",
+                "gpt-5.4",
+                prompt_id,
+                "原始文章",
+            )
+
+        self.assertEqual(result["content"], "这是改写成功后的正文内容。")
+        merged_logs = "\n".join(captured_logs.output)
+        self.assertIn("文章改写 response payload", merged_logs)
+        self.assertIn('"id": "chatcmpl-success"', merged_logs)
+        self.assertIn("文章改写 response text", merged_logs)
+        self.assertIn("这是改写成功后的正文内容。", merged_logs)
+
+    def test_rewrite_article_logs_task_id_when_provided(self) -> None:
+        sample_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "############content\n这是改写后的文章内容。"
+                    }
+                }
+            ]
+        }
+
+        with (
+            patch(
+                "app.accounts.urlopen",
+                return_value=FakeResponse(
+                    json.dumps(sample_payload, ensure_ascii=False).encode("utf-8"),
+                    status=200,
+                ),
+            ),
+            self.assertLogs("app.accounts", level="INFO") as captured_logs,
+        ):
+            result = self.service.rewrite_article_with_prompt(
+                "https://api.example.com/v1",
+                "secret-token",
+                "gpt-5.4",
+                "请改写。",
+                "原始文章",
+                task_id=88,
+            )
+
+        self.assertEqual(result["content"], "这是改写后的文章内容。")
+        merged_logs = "\n".join(captured_logs.output)
+        self.assertIn("文章改写 request task_id=88", merged_logs)
+        self.assertIn("文章改写 response received task_id=88", merged_logs)
+        self.assertIn("文章改写 response payload task_id=88", merged_logs)
+        self.assertIn("文章改写 response text task_id=88", merged_logs)
 
     def test_rewrite_article_accepts_api_key_with_bearer_prefix(self) -> None:
         settings = self.service.save_model_settings(
@@ -379,13 +465,81 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Authorization"], "Bearer secret-token")
         self.assertEqual(result["content"], "改写完成")
 
-    def test_build_rewrite_system_prompt_appends_fixed_format_instruction(self) -> None:
+    def test_rewrite_article_logs_response_summary_when_model_text_is_missing(self) -> None:
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "请改写。",
+            [
+                "请把文章改写得更流畅。",
+            ],
+        )
+        prompt_id = settings["prompts"][0]["id"]
+        sample_payload = {
+            "id": "chatcmpl-test",
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 0,
+                "total_tokens": 120,
+            },
+        }
+
+        with (
+            patch(
+                "app.accounts.urlopen",
+                return_value=FakeResponse(
+                    json.dumps(sample_payload, ensure_ascii=False).encode("utf-8"),
+                    status=200,
+                ),
+            ),
+            self.assertLogs("app.accounts", level="WARNING") as captured_logs,
+        ):
+            with self.assertRaisesRegex(
+                Exception,
+                r"模型网关兼容异常：finish_reason=stop，但未返回正文内容。",
+            ) as captured_error:
+                self.service.rewrite_article(
+                    "https://api.example.com/v1",
+                    "secret-token",
+                    "gpt-5.4",
+                    prompt_id,
+                    "原始文章",
+                )
+
+        self.assertEqual(
+            str(captured_error.exception),
+            "模型网关兼容异常：finish_reason=stop，但未返回正文内容。",
+        )
+        merged_logs = "\n".join(captured_logs.output)
+        self.assertIn("文章改写 response parse failed", merged_logs)
+        self.assertIn("finish_reason=stop", merged_logs)
+        self.assertIn("message_content=none", merged_logs)
+        self.assertIn("模型网关兼容异常：finish_reason=stop，但未返回正文内容。", merged_logs)
+
+    def test_build_rewrite_system_prompt_keeps_only_custom_instruction(self) -> None:
         prompt = self.service.build_rewrite_system_prompt("请把文章改写得更流畅。")
 
-        self.assertTrue(prompt.startswith("请把文章改写得更流畅。"))
-        self.assertIn("只返回改写后的正文内容", prompt)
-        self.assertIn("############content", prompt)
-        self.assertIn("######触发红线，禁止改写", prompt)
+        self.assertEqual(prompt, "请把文章改写得更流畅。")
+
+    def test_build_rewrite_user_content_appends_fixed_format_instruction(self) -> None:
+        user_content = self.service.build_rewrite_user_content("原始文章内容")
+
+        self.assertTrue(user_content.startswith("原始文章内容"))
+        self.assertIn("只返回改写后的正文内容", user_content)
+        self.assertIn("############content", user_content)
+        self.assertIn("######触发红线，禁止改写", user_content)
 
     def test_normalize_rewrite_response_text_removes_content_header(self) -> None:
         normalized = self.service.normalize_rewrite_response_text(
@@ -552,25 +706,30 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(captured["url"], "https://api.example.com/v1/chat/completions")
         self.assertEqual(captured["timeout"], 20 * 60.0)
         self.assertEqual(captured["headers"]["Authorization"], "Bearer secret-token")
+        self.assertEqual(
+            captured["body"]["messages"][0]["content"],
+            "根据文章生成一个克制、准确的标题。",
+        )
         self.assertTrue(
-            captured["body"]["messages"][0]["content"].startswith(
-                "根据文章生成一个克制、准确的标题。"
+            captured["body"]["messages"][1]["content"].startswith(
+                "这是一篇待生成标题的文章内容。"
             )
         )
-        self.assertIn("只返回标题", captured["body"]["messages"][0]["content"])
-        self.assertIn("########title", captured["body"]["messages"][0]["content"])
-        self.assertEqual(
-            captured["body"]["messages"][1]["content"],
-            "这是一篇待生成标题的文章内容。",
-        )
+        self.assertIn("只返回标题", captured["body"]["messages"][1]["content"])
+        self.assertIn("########title", captured["body"]["messages"][1]["content"])
         self.assertEqual(result["title"], "一个更精炼的新标题")
 
-    def test_build_title_system_prompt_appends_fixed_format_instruction(self) -> None:
+    def test_build_title_system_prompt_keeps_only_custom_instruction(self) -> None:
         prompt = self.service.build_title_system_prompt("根据文章生成标题。")
 
-        self.assertTrue(prompt.startswith("根据文章生成标题。"))
-        self.assertIn("只返回标题", prompt)
-        self.assertIn("########title", prompt)
+        self.assertEqual(prompt, "根据文章生成标题。")
+
+    def test_build_title_user_content_appends_fixed_format_instruction(self) -> None:
+        user_content = self.service.build_title_user_content("这是一篇待生成标题的文章内容。")
+
+        self.assertTrue(user_content.startswith("这是一篇待生成标题的文章内容。"))
+        self.assertIn("只返回标题", user_content)
+        self.assertIn("########title", user_content)
 
     def test_normalize_title_response_text_removes_title_header(self) -> None:
         normalized = self.service.normalize_title_response_text(
@@ -578,6 +737,12 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized, "一个更精炼的新标题")
+
+    def test_normalize_title_response_text_rejects_review_text(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "只接受单行短标题"):
+            self.service.normalize_title_response_text(
+                "你的这篇文章整体上是强判断、强叙事、强情绪推动的评论文风，感染力很强，节奏也不错。"
+            )
 
     def test_test_model_connection_returns_response_text(self) -> None:
         captured: dict[str, object] = {}
@@ -598,7 +763,10 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             captured["body"] = json.loads(request.data.decode("utf-8"))
             return FakeResponse(json.dumps(sample_payload, ensure_ascii=False).encode("utf-8"))
 
-        with patch("app.accounts.urlopen", side_effect=fake_urlopen):
+        with (
+            patch("app.accounts.urlopen", side_effect=fake_urlopen),
+            self.assertLogs("app.accounts", level="INFO") as captured_logs,
+        ):
             result = self.service.test_model_connection(
                 "https://api.example.com/v1",
                 "secret-token",
@@ -611,6 +779,13 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(result["message"], "模型连接测试成功")
         self.assertEqual(result["responseText"], "连接成功")
         self.assertEqual(result["model"], "gpt-5.4")
+        merged_logs = "\n".join(captured_logs.output)
+        self.assertIn("模型连接测试 request task_id=-", merged_logs)
+        self.assertIn("模型连接测试 request payload task_id=-", merged_logs)
+        self.assertIn("system_prompt=你是模型连接测试助手。请只返回“连接成功”四个字。", merged_logs)
+        self.assertIn("user_content=请返回连接成功。", merged_logs)
+        self.assertIn("模型连接测试 response payload task_id=-", merged_logs)
+        self.assertIn("模型连接测试 response text task_id=-", merged_logs)
 
     def test_extract_model_error_message_uses_html_title(self) -> None:
         raw_html = b"""
@@ -1065,6 +1240,62 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(mocked_rewrite.call_count, 4)
         self.assertEqual(task.status, "待生成标题")
         self.assertEqual(task.rewritten_content, "改写成功正文")
+
+    def test_run_rewrite_task_does_not_retry_nonretryable_gateway_compatibility_error(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf",
+            "测试账号",
+            False,
+        )
+        created = self.service.create_task_record(
+            account["id"],
+            "",
+            "待处理",
+            article_id=101,
+            article_content="原始文章内容",
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service,
+            "rewrite_article_with_prompt",
+            side_effect=NonRetryableTaskStageError(
+                "模型网关兼容异常：finish_reason=stop，但未返回正文内容。"
+            ),
+        ) as mocked_rewrite:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"模型网关兼容异常：finish_reason=stop，但未返回正文内容。",
+            ):
+                self.service._run_rewrite_task(created["id"])
+
+        task = self.service.get_task_record(created["id"])
+
+        self.assertEqual(mocked_rewrite.call_count, 1)
+        self.assertEqual(task.status, "S1失败")
+        self.assertEqual(
+            task.huasheng_status,
+            "模型网关兼容异常：finish_reason=stop，但未返回正文内容。",
+        )
+
+    def test_finalize_submitted_task_suppresses_duplicate_warning_for_logged_stage_failure(self) -> None:
+        future: Future[None] = Future()
+        try:
+            raise RuntimeError("外层错误") from ValueError("内层错误")
+        except RuntimeError as exc:
+            future.set_exception(exc)
+
+        with (
+            patch("app.accounts.logger.warning") as mocked_warning,
+            patch("app.accounts.logger.debug") as mocked_debug,
+        ):
+            self.service._finalize_submitted_task(7, stage="rewrite", future=future)
+
+        mocked_warning.assert_not_called()
+        mocked_debug.assert_called()
 
     def test_run_huasheng_create_task_retries_three_times_before_success(self) -> None:
         account = self.service.create_account(
@@ -1958,4 +2189,3 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

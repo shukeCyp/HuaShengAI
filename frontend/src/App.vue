@@ -1,5 +1,5 @@
 ﻿<script setup>
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
 import ArticleLibrarySection from './components/ArticleLibrarySection.vue'
 import ArticleMonitoringSection from './components/ArticleMonitoringSection.vue'
@@ -151,6 +151,7 @@ const taskDeleteLoading = ref(false)
 const taskRecords = ref([])
 const downloadingTaskIds = ref([])
 const retryingTaskIds = ref([])
+const deletingTaskIds = ref([])
 const currentProjectTaskRecordId = ref(null)
 const projectLoading = ref(false)
 const projectPolling = ref(false)
@@ -829,6 +830,10 @@ function isTaskRetrying(taskId) {
   return retryingTaskIds.value.includes(Number(taskId) || 0)
 }
 
+function isTaskDeleting(taskId) {
+  return deletingTaskIds.value.includes(Number(taskId) || 0)
+}
+
 function setTaskDownloading(taskId, downloading) {
   const normalizedTaskId = Number(taskId) || 0
   if (normalizedTaskId <= 0) {
@@ -861,9 +866,25 @@ function setTaskRetrying(taskId, retrying) {
   retryingTaskIds.value = retryingTaskIds.value.filter((item) => item !== normalizedTaskId)
 }
 
+function setTaskDeleting(taskId, deleting) {
+  const normalizedTaskId = Number(taskId) || 0
+  if (normalizedTaskId <= 0) {
+    return
+  }
+
+  if (deleting) {
+    if (!deletingTaskIds.value.includes(normalizedTaskId)) {
+      deletingTaskIds.value = [...deletingTaskIds.value, normalizedTaskId]
+    }
+    return
+  }
+
+  deletingTaskIds.value = deletingTaskIds.value.filter((item) => item !== normalizedTaskId)
+}
+
 function isTaskRetryable(task) {
   const status = String(task?.status || '').trim()
-  return ['S1澶辫触', 'S2澶辫触', 'S3澶辫触', 'S4澶辫触'].includes(status)
+  return /^S[1-4]失败$/.test(status)
 }
 
 function stopProjectPolling() {
@@ -1935,6 +1956,36 @@ async function deleteAllTaskRecords() {
   }
 }
 
+async function deleteTaskRecord(task) {
+  const taskId = Number(task?.id) || 0
+  if (taskId <= 0) {
+    statusMessage.value = '任务数据无效，无法删除'
+    return
+  }
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+  if (isTaskDeleting(taskId)) {
+    return
+  }
+
+  setTaskDeleting(taskId, true)
+
+  try {
+    const payload = await callDesktop('delete_task_record', taskId)
+    if (currentProjectTaskRecordId.value === taskId) {
+      currentProjectTaskRecordId.value = null
+    }
+    await loadTasks('任务列表已同步', { silent: true })
+    statusMessage.value = `任务 #${taskId} 已删除，影响 ${Number(payload?.deletedCount || 0)} 条记录`
+  } catch (error) {
+    statusMessage.value = `删除任务失败: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    setTaskDeleting(taskId, false)
+  }
+}
+
 async function downloadTaskVideo(task) {
   const taskId = Number(task?.id) || 0
   if (taskId <= 0) {
@@ -1954,14 +2005,18 @@ async function downloadTaskVideo(task) {
   }
 
   setTaskDownloading(taskId, true)
+  statusMessage.value = `任务 #${taskId} 正在准备下载，请稍候`
 
   try {
-    const payload = await callDesktop('download_task_video', taskId)
-    await loadTasks('任务列表已同步', { silent: true })
-    statusMessage.value = `视频已下载到 ${payload?.downloadPath || '--'}，任务已自动删除`
+    await nextTick()
+    const payload = await callDesktop('start_download_task_video', taskId)
+    if (payload?.alreadyRunning) {
+      statusMessage.value = `任务 #${taskId} 正在下载中，请稍候`
+      return
+    }
+    statusMessage.value = `任务 #${taskId} 开始下载视频，请稍候`
   } catch (error) {
     statusMessage.value = `下载视频失败: ${error instanceof Error ? error.message : String(error)}`
-  } finally {
     setTaskDownloading(taskId, false)
   }
 }
@@ -2392,6 +2447,10 @@ function getTaskStatusDetail(task) {
       return huashengStatus
     }
     return '扫描中'
+  }
+
+  if (/^S[1-4]失败$/.test(status)) {
+    return huashengStatus || '处理失败'
   }
 
   return ''
@@ -2871,7 +2930,7 @@ async function createProjectTask() {
   }
 }
 
-function handleDesktopEvent(event) {
+async function handleDesktopEvent(event) {
   if (!event?.type) {
     return
   }
@@ -2893,6 +2952,35 @@ function handleDesktopEvent(event) {
 
   if (event.type === 'accounts.status-changed' && event.payload?.account?.phone) {
     statusMessage.value = `${event.payload.account.phone} 状态已变更`
+    return
+  }
+
+  if (event.type === 'tasks.download.started') {
+    const taskId = Number(event.payload?.taskId || 0)
+    if (taskId > 0) {
+      setTaskDownloading(taskId, true)
+      statusMessage.value = `任务 #${taskId} 开始下载视频，请稍候`
+    }
+    return
+  }
+
+  if (event.type === 'tasks.download.finished') {
+    const taskId = Number(event.payload?.taskId || 0)
+    if (taskId > 0) {
+      setTaskDownloading(taskId, false)
+    }
+    await loadTasks('任务列表已同步', { silent: true })
+    statusMessage.value = `视频已下载到 ${event.payload?.downloadPath || '--'}，任务已自动删除`
+    return
+  }
+
+  if (event.type === 'tasks.download.failed') {
+    const taskId = Number(event.payload?.taskId || 0)
+    if (taskId > 0) {
+      setTaskDownloading(taskId, false)
+    }
+    statusMessage.value = `下载视频失败: ${event.payload?.errorMessage || '未知错误'}`
+    return
   }
 }
 
@@ -3168,6 +3256,7 @@ watch(selectedTtsVoiceId, (value) => {
               <span class="task-head-cell task-col-status">状态</span>
               <span class="task-head-cell task-col-action">重试</span>
               <span class="task-head-cell task-col-action">下载</span>
+              <span class="task-head-cell task-col-action">删除</span>
             </div>
 
             <article
@@ -3213,6 +3302,16 @@ watch(selectedTtsVoiceId, (value) => {
                   {{ isTaskDownloading(task.id) ? '下载中...' : '下载' }}
                 </button>
                 <span v-else class="task-download-placeholder">--</span>
+              </span>
+              <span class="task-cell task-cell-actions task-col-action">
+                <button
+                  type="button"
+                  class="toolbar-button secondary task-delete-button"
+                  :disabled="isTaskDeleting(task.id) || !desktopReady"
+                  @click="deleteTaskRecord(task)"
+                >
+                  {{ isTaskDeleting(task.id) ? '删除中...' : '删除' }}
+                </button>
               </span>
             </article>
           </div>
