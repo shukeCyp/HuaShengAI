@@ -14,6 +14,7 @@ import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
 
 from app.accounts import AccountService
+from app.autovideo import AutoVideoAutomation
 from app.config import APP_VERSION
 from app.huasheng import HuaShengAutomation
 from app.microheadline import MicroHeadlineService
@@ -257,11 +258,13 @@ class AppApi:
         bridge: DesktopBridge,
         account_service: AccountService,
         huasheng: HuaShengAutomation | None = None,
+        autovideo: AutoVideoAutomation | None = None,
         microheadline: MicroHeadlineService | None = None,
     ) -> None:
         self._bridge = bridge
         self._account_service = account_service
         self._huasheng = huasheng or HuaShengAutomation()
+        self._autovideo = autovideo or AutoVideoAutomation()
         self._microheadline = microheadline or MicroHeadlineService(account_service.db_path)
         self._download_task_ids_lock = Lock()
         self._download_task_ids_inflight: set[int] = set()
@@ -334,6 +337,7 @@ class AppApi:
             "tasks.download.started",
             {
                 "taskId": normalized_task_id,
+                "progressPercent": 0,
                 "databasePath": str(self._account_service.db_path),
             },
         )
@@ -352,7 +356,16 @@ class AppApi:
 
     def _run_task_video_download_worker(self, task_id: int) -> None:
         try:
-            payload = self._account_service.download_task_video(task_id)
+            payload = self._account_service.download_task_video_with_progress(
+                task_id,
+                progress_callback=lambda progress_payload: self._bridge.publish_event(
+                    "tasks.download.progress",
+                    {
+                        **progress_payload,
+                        "databasePath": str(self._account_service.db_path),
+                    },
+                ),
+            )
         except Exception as exc:
             logger.warning(
                 "AppApi.start_download_task_video worker failed task_id=%s error=%s",
@@ -437,15 +450,36 @@ class AppApi:
         self,
         thread_pool_size: int,
         download_dir: str | None = None,
+        generation_provider: str | None = None,
+        auto_download_videos: bool | None = None,
+        auto_delete_redline_tasks: bool | None = None,
+        rewrite_thread_pool_size: int | None = None,
+        title_thread_pool_size: int | None = None,
+        create_thread_pool_size: int | None = None,
+        progress_thread_pool_size: int | None = None,
     ) -> dict[str, Any]:
         logger.info(
-            "AppApi.save_global_settings called thread_pool_size=%s download_dir_length=%s",
+            "AppApi.save_global_settings called thread_pool_size=%s download_dir_length=%s generation_provider=%s auto_download_videos=%s auto_delete_redline_tasks=%s rewrite_thread_pool_size=%s title_thread_pool_size=%s create_thread_pool_size=%s progress_thread_pool_size=%s",
             thread_pool_size,
             len(str(download_dir or "")),
+            str(generation_provider or ""),
+            auto_download_videos,
+            auto_delete_redline_tasks,
+            rewrite_thread_pool_size,
+            title_thread_pool_size,
+            create_thread_pool_size,
+            progress_thread_pool_size,
         )
         return self._account_service.save_global_settings(
             thread_pool_size,
             None if download_dir is None else str(download_dir),
+            None if generation_provider is None else str(generation_provider),
+            None if auto_download_videos is None else bool(auto_download_videos),
+            None if auto_delete_redline_tasks is None else bool(auto_delete_redline_tasks),
+            rewrite_thread_pool_size,
+            title_thread_pool_size,
+            create_thread_pool_size,
+            progress_thread_pool_size,
         )
 
     def get_log_status(self) -> dict[str, Any]:
@@ -483,6 +517,9 @@ class AppApi:
     def get_huasheng_voice_settings(self) -> dict[str, Any]:
         return self._account_service.get_huasheng_voice_settings_payload()
 
+    def get_autovideo_settings(self) -> dict[str, Any]:
+        return self._account_service.get_autovideo_settings_payload()
+
     def save_huasheng_voice_settings(
         self,
         voice_id: int,
@@ -511,6 +548,21 @@ class AppApi:
             str(cover or ""),
             speech_rate,
             max_concurrent_tasks_per_account,
+        )
+
+    def save_autovideo_settings(
+        self,
+        voice_choice: str,
+        rate_choice: str,
+    ) -> dict[str, Any]:
+        logger.info(
+            "AppApi.save_autovideo_settings called voice_choice=%s rate_choice=%s",
+            str(voice_choice or ""),
+            str(rate_choice or ""),
+        )
+        return self._account_service.save_autovideo_settings(
+            str(voice_choice or ""),
+            str(rate_choice or ""),
         )
 
     def get_model_settings(self) -> dict[str, Any]:
@@ -834,6 +886,24 @@ class AppApi:
             pn=pn,
             ps=ps,
             category_id=category_id,
+        )
+
+    def generate_autovideo_video(
+        self,
+        story_text: str,
+        voice_choice: str,
+        rate_choice: str,
+    ) -> dict[str, Any]:
+        logger.info(
+            "AppApi.generate_autovideo_video called story_length=%s voice_choice=%s rate_choice=%s",
+            len(str(story_text or "")),
+            str(voice_choice or ""),
+            str(rate_choice or ""),
+        )
+        return self._autovideo.generate_video(
+            story_text=str(story_text or ""),
+            voice_choice=str(voice_choice or ""),
+            rate_choice=str(rate_choice or ""),
         )
 
     def create_project(

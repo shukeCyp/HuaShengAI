@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from peewee import IntegrityError
 
+from app.autovideo import AutoVideoAutomation
 from app.database import database
 from app.huasheng import HuaShengAutomation
 from app.logging_utils import resolve_daily_log_path, resolve_log_directory_from_db_path
@@ -40,6 +41,7 @@ SUBTITLE_SETTINGS_KEY = "subtitle_settings"
 HUASHENG_VOICE_SETTINGS_KEY = "huasheng_voice_settings"
 MODEL_SETTINGS_KEY = "model_settings"
 GLOBAL_SETTINGS_KEY = "global_settings"
+AUTOVIDEO_SETTINGS_KEY = "autovideo_settings"
 SUBTITLE_FONT_SIZE_OPTIONS = [
     {"label": "超小号", "value": 22},
     {"label": "小号", "value": 32},
@@ -106,8 +108,15 @@ DEFAULT_MODEL_SETTINGS = {
     "titlePrompt": "",
 }
 DEFAULT_GLOBAL_SETTINGS = {
-    "threadPoolSize": 3,
+    "threadPoolSize": 8,
     "downloadDir": "",
+    "generationProvider": "huasheng",
+    "autoDownloadVideos": False,
+    "autoDeleteRedlineTasks": False,
+    "rewriteThreadPoolSize": 3,
+    "titleThreadPoolSize": 3,
+    "createThreadPoolSize": 1,
+    "progressThreadPoolSize": 1,
 }
 DEFAULT_HUASHENG_VOICE_SETTINGS = {
     "voiceId": 0,
@@ -118,6 +127,10 @@ DEFAULT_HUASHENG_VOICE_SETTINGS = {
     "cover": "",
     "speechRate": 1,
     "maxConcurrentTasksPerAccount": 1,
+}
+DEFAULT_AUTOVIDEO_SETTINGS = {
+    "voiceChoice": AutoVideoAutomation.DEFAULT_VOICE_CHOICE,
+    "rateChoice": AutoVideoAutomation.DEFAULT_RATE_CHOICE,
 }
 MODEL_REQUEST_TIMEOUT = 60.0
 REWRITE_MODEL_REQUEST_TIMEOUT = 20 * 60.0
@@ -162,6 +175,7 @@ MODEL_CONNECTION_TEST_USER_CONTENT = "请返回连接成功。"
 TASK_QUEUE_SCAN_INTERVAL_SECONDS = 5
 TASK_THREAD_POOL_MIN_SIZE = 1
 TASK_THREAD_POOL_MAX_SIZE = 32
+TASK_EXECUTOR_THREAD_POOL_MAX_SIZE = TASK_THREAD_POOL_MAX_SIZE * 4
 TASK_STAGE_MAX_RETRIES = 3
 HUASHENG_DAILY_PROJECT_LIMIT = 50
 HUASHENG_DAILY_LIMIT_REACHED_CODE = 10008
@@ -173,8 +187,10 @@ TASK_STATUS_REWRITE_FAILED = "S1失败"
 TASK_STATUS_REWRITE_REDLINE = "触发红线"
 TASK_STATUS_TITLE_RUNNING = "S2标题中"
 TASK_STATUS_READY_FOR_HUASHENG = "待创建花生任务"
+TASK_STATUS_READY_FOR_VIDEO = "待生成视频"
 TASK_STATUS_TITLE_FAILED = "S2失败"
 TASK_STATUS_HUASHENG_CREATING = "S3创建花生中"
+TASK_STATUS_VIDEO_CREATING = "S3生成视频中"
 TASK_STATUS_HUASHENG_CREATE_FAILED = "S3失败"
 TASK_STATUS_HUASHENG_POLLING = "S4扫描中"
 TASK_STATUS_SUBTITLE_APPLYING = "设置字幕中"
@@ -190,6 +206,8 @@ TASK_STAGE_REWRITE = "rewrite"
 TASK_STAGE_TITLE = "title"
 TASK_STAGE_HUASHENG_CREATE = "huasheng_create"
 TASK_STAGE_HUASHENG_PROGRESS = "huasheng_progress"
+GENERATION_PROVIDER_HUASHENG = "huasheng"
+GENERATION_PROVIDER_AUTOVIDEO = "autovideo"
 REWRITE_REDLINE_RESPONSE_TEXT = "######触发红线，禁止改写"
 REWRITE_REDLINE_DISPLAY_TEXT = "触发红线，禁止改写"
 REWRITE_REDLINE_FUZZY_KEYWORDS = (
@@ -218,9 +236,15 @@ class NonRetryableTaskStageError(RuntimeError):
 
 
 class AccountService:
-    def __init__(self, db_path: Path, huasheng: HuaShengAutomation | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        huasheng: HuaShengAutomation | None = None,
+        autovideo: AutoVideoAutomation | None = None,
+    ) -> None:
         self.db_path = db_path
         self._huasheng = huasheng or HuaShengAutomation()
+        self._autovideo = autovideo or AutoVideoAutomation()
         self._task_processor_state_lock = RLock()
         self._task_processor_stop_event = Event()
         self._task_processor_thread: Thread | None = None
@@ -424,7 +448,7 @@ class AccountService:
                 task.export_task_id = ""
                 task.export_version = ""
             elif current_status == TASK_STATUS_HUASHENG_CREATE_FAILED:
-                task.status = TASK_STATUS_READY_FOR_HUASHENG
+                task.status = self.get_task_ready_for_generation_status(task)
                 task.project_pid = ""
                 task.progress = 0
                 task.video_url = ""
@@ -435,14 +459,19 @@ class AccountService:
                 task.status = (
                     TASK_STATUS_HUASHENG_POLLING
                     if str(task.project_pid or "").strip()
-                    else TASK_STATUS_READY_FOR_HUASHENG
+                    else self.get_task_ready_for_generation_status(task)
                 )
                 task.progress = 0
                 task.video_url = ""
                 task.huasheng_status = (
                     "等待花生处理"
                     if str(task.project_pid or "").strip()
-                    else TASK_HUASHENG_STATUS_NOT_CREATED
+                    else (
+                        "等待 AutoVideo 生成"
+                        if self.get_task_generation_provider(task)
+                        == GENERATION_PROVIDER_AUTOVIDEO
+                        else TASK_HUASHENG_STATUS_NOT_CREATED
+                    )
                 )
                 if not str(task.project_pid or "").strip():
                     task.export_task_id = ""
@@ -500,6 +529,13 @@ class AccountService:
         }
 
     def download_task_video(self, task_id: int) -> dict[str, Any]:
+        return self.download_task_video_with_progress(task_id)
+
+    def download_task_video_with_progress(
+        self,
+        task_id: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         normalized_task_id = self.normalize_positive_int(task_id, field_name="task_id")
         task = self.get_task_record(normalized_task_id)
         video_url = self.normalize_required_text_field(
@@ -524,7 +560,12 @@ class AccountService:
                     video_url,
                     final_path,
                 )
-                self._download_video_to_path(video_url, temp_path)
+                self._download_video_to_path(
+                    video_url,
+                    temp_path,
+                    progress_callback=progress_callback,
+                    task_id=normalized_task_id,
+                )
                 temp_path.replace(final_path)
                 delete_payload = self.delete_task_record(normalized_task_id)
                 logger.info(
@@ -774,10 +815,7 @@ class AccountService:
             )
         normalized_account_id = None
         if account_id is not None:
-            normalized_account_id = self.normalize_positive_int(
-                account_id,
-                field_name="account_id",
-            )
+            normalized_account_id = self.normalize_task_account_id(account_id)
         normalized_account_phone = None
         if account_phone is not None:
             normalized_account_phone = self.normalize_text_field(
@@ -865,11 +903,14 @@ class AccountService:
             raise ValueError("请至少选择一个改写提示词。")
 
         timestamp = now_local()
+        generation_provider = self.get_current_generation_provider()
 
         with database.connection_context():
             if not database.table_exists(MonitoredArticle._meta.table_name):
                 raise ValueError("文章表不存在，请先抓取文章后再处理。")
-            account = self.get_default_task_account()
+            account_snapshot = self.get_default_task_account_snapshot(
+                generation_provider=generation_provider
+            )
             articles = list(
                 MonitoredArticle.select(
                     MonitoredArticle.id,
@@ -910,10 +951,11 @@ class AccountService:
                     for prompt_id in normalized_prompt_ids:
                         prompt = prompt_map[prompt_id]
                         task = TaskRecord.create(
-                            account_id=account.id,
-                            account_phone=account.phone,
-                            account_note=account.note,
-                            account_cookies=account.cookies,
+                            account_id=account_snapshot["accountId"],
+                            account_phone=account_snapshot["phone"],
+                            account_note=account_snapshot["note"],
+                            account_cookies=account_snapshot["cookies"],
+                            generation_provider=generation_provider,
                             project_pid="",
                             article_id=article_id,
                             article_content=article_content,
@@ -942,7 +984,8 @@ class AccountService:
             "articleCount": len(available_article_ids),
             "promptCount": len(normalized_prompt_ids),
             "deletedArticleCount": deleted_article_count,
-            "accountId": account.id,
+            "accountId": account_snapshot["accountId"],
+            "generationProvider": generation_provider,
             "databasePath": str(self.db_path),
         }
 
@@ -1035,6 +1078,13 @@ class AccountService:
         self,
         thread_pool_size: int,
         download_dir: str | None = None,
+        generation_provider: str | None = None,
+        auto_download_videos: bool | None = None,
+        auto_delete_redline_tasks: bool | None = None,
+        rewrite_thread_pool_size: int | None = None,
+        title_thread_pool_size: int | None = None,
+        create_thread_pool_size: int | None = None,
+        progress_thread_pool_size: int | None = None,
     ) -> dict[str, Any]:
         settings_input: dict[str, Any] = {
             "threadPoolSize": thread_pool_size,
@@ -1044,6 +1094,61 @@ class AccountService:
             settings_input["downloadDir"] = existing_settings.get("downloadDir", "")
         else:
             settings_input["downloadDir"] = download_dir
+        if generation_provider is None:
+            settings_input["generationProvider"] = existing_settings.get(
+                "generationProvider",
+                DEFAULT_GLOBAL_SETTINGS["generationProvider"],
+            )
+        else:
+            settings_input["generationProvider"] = generation_provider
+        if auto_download_videos is None:
+            settings_input["autoDownloadVideos"] = existing_settings.get(
+                "autoDownloadVideos",
+                DEFAULT_GLOBAL_SETTINGS["autoDownloadVideos"],
+            )
+        else:
+            settings_input["autoDownloadVideos"] = auto_download_videos
+        if auto_delete_redline_tasks is None:
+            settings_input["autoDeleteRedlineTasks"] = existing_settings.get(
+                "autoDeleteRedlineTasks",
+                DEFAULT_GLOBAL_SETTINGS["autoDeleteRedlineTasks"],
+            )
+        else:
+            settings_input["autoDeleteRedlineTasks"] = auto_delete_redline_tasks
+        if rewrite_thread_pool_size is None:
+            settings_input["rewriteThreadPoolSize"] = existing_settings.get(
+                "rewriteThreadPoolSize",
+                existing_settings.get(
+                    "threadPoolSize",
+                    DEFAULT_GLOBAL_SETTINGS["rewriteThreadPoolSize"],
+                ),
+            )
+        else:
+            settings_input["rewriteThreadPoolSize"] = rewrite_thread_pool_size
+        if title_thread_pool_size is None:
+            settings_input["titleThreadPoolSize"] = existing_settings.get(
+                "titleThreadPoolSize",
+                existing_settings.get(
+                    "threadPoolSize",
+                    DEFAULT_GLOBAL_SETTINGS["titleThreadPoolSize"],
+                ),
+            )
+        else:
+            settings_input["titleThreadPoolSize"] = title_thread_pool_size
+        if create_thread_pool_size is None:
+            settings_input["createThreadPoolSize"] = existing_settings.get(
+                "createThreadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["createThreadPoolSize"],
+            )
+        else:
+            settings_input["createThreadPoolSize"] = create_thread_pool_size
+        if progress_thread_pool_size is None:
+            settings_input["progressThreadPoolSize"] = existing_settings.get(
+                "progressThreadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["progressThreadPoolSize"],
+            )
+        else:
+            settings_input["progressThreadPoolSize"] = progress_thread_pool_size
 
         settings = self.normalize_global_settings(settings_input)
         timestamp = now_local()
@@ -1235,6 +1340,66 @@ class AccountService:
             updated_at=timestamp,
         )
 
+    def get_autovideo_settings_payload(self) -> dict[str, Any]:
+        with database.connection_context():
+            setting = AppSetting.get_or_none(AppSetting.key == AUTOVIDEO_SETTINGS_KEY)
+            if setting is None:
+                timestamp = now_local()
+                settings = self.default_autovideo_settings()
+                setting = AppSetting.create(
+                    key=AUTOVIDEO_SETTINGS_KEY,
+                    value=json.dumps(settings, ensure_ascii=False),
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+            else:
+                settings = self.normalize_autovideo_settings(
+                    self.deserialize_setting_value(setting.value)
+                )
+                persisted_value = json.dumps(settings, ensure_ascii=False)
+                if setting.value != persisted_value:
+                    setting.value = persisted_value
+                    setting.updated_at = now_local()
+                    setting.save()
+
+        return self.build_autovideo_settings_payload(
+            settings,
+            updated_at=setting.updated_at,
+        )
+
+    def save_autovideo_settings(
+        self,
+        voice_choice: str,
+        rate_choice: str,
+    ) -> dict[str, Any]:
+        settings = self.normalize_autovideo_settings(
+            {
+                "voiceChoice": voice_choice,
+                "rateChoice": rate_choice,
+            }
+        )
+        timestamp = now_local()
+
+        with database.connection_context():
+            setting = AppSetting.get_or_none(AppSetting.key == AUTOVIDEO_SETTINGS_KEY)
+            serialized = json.dumps(settings, ensure_ascii=False)
+            if setting is None:
+                setting = AppSetting.create(
+                    key=AUTOVIDEO_SETTINGS_KEY,
+                    value=serialized,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+            else:
+                setting.value = serialized
+                setting.updated_at = timestamp
+                setting.save()
+
+        return self.build_autovideo_settings_payload(
+            settings,
+            updated_at=timestamp,
+        )
+
     def save_model_settings(
         self,
         base_url: str,
@@ -1407,7 +1572,8 @@ class AccountService:
 
     def normalize_rewrite_response_text(self, text: str) -> str:
         normalized = self._strip_labeled_output(text, label="content")
-        return self._strip_markdown_code_fence(normalized)
+        normalized = self._strip_markdown_code_fence(normalized)
+        return self._strip_rewrite_markdown_chars(normalized)
 
     def is_rewrite_redline_response(self, text: str) -> bool:
         normalized = self._strip_markdown_code_fence(str(text or "").strip())
@@ -1495,8 +1661,12 @@ class AccountService:
             thread = self._task_processor_thread
 
         logger.info(
-            "Task processor starting thread_pool_size=%s scan_interval=%ss",
+            "Task processor starting executor_thread_pool_size=%s rewrite_limit=%s title_limit=%s create_limit=%s progress_limit=%s scan_interval=%ss",
             settings["threadPoolSize"],
+            settings["rewriteThreadPoolSize"],
+            settings["titleThreadPoolSize"],
+            settings["createThreadPoolSize"],
+            settings["progressThreadPoolSize"],
             TASK_QUEUE_SCAN_INTERVAL_SECONDS,
         )
         thread.start()
@@ -1526,7 +1696,7 @@ class AccountService:
     def configure_task_executor(self, thread_pool_size: int) -> None:
         previous_executor: ThreadPoolExecutor | None = None
         with self._task_processor_state_lock:
-            normalized_size = self.normalize_thread_pool_size(thread_pool_size)
+            normalized_size = self.normalize_executor_thread_pool_size(thread_pool_size)
             if (
                 self._task_executor is not None
                 and self._task_executor_size == normalized_size
@@ -1539,6 +1709,7 @@ class AccountService:
             previous_executor.shutdown(wait=False, cancel_futures=False)
 
     def process_task_queue_once(self) -> dict[str, int]:
+        global_settings = self.get_global_settings_payload()["settings"]
         model_settings = self.get_model_settings_payload()["settings"]
         has_model_connection = self.has_model_connection_settings(model_settings)
         rewrite_task_ids = (
@@ -1556,6 +1727,17 @@ class AccountService:
             inflight_huasheng_progress = len(self._huasheng_progress_task_ids_inflight)
             executor_size = self._task_executor_size
 
+        rewrite_slots = max(0, int(global_settings["rewriteThreadPoolSize"]) - inflight_rewrite)
+        title_slots = max(0, int(global_settings["titleThreadPoolSize"]) - inflight_title)
+        huasheng_create_slots = max(
+            0,
+            int(global_settings["createThreadPoolSize"]) - inflight_huasheng_create,
+        )
+        huasheng_progress_slots = max(
+            0,
+            int(global_settings["progressThreadPoolSize"]) - inflight_huasheng_progress,
+        )
+
         if (
             rewrite_task_ids
             or title_task_ids
@@ -1567,7 +1749,7 @@ class AccountService:
             or inflight_huasheng_progress
         ):
             logger.debug(
-                "Task processor scan pending_rewrite=%s pending_title=%s pending_huasheng_create=%s pending_huasheng_progress=%s inflight_rewrite=%s inflight_title=%s inflight_huasheng_create=%s inflight_huasheng_progress=%s executor_size=%s",
+                "Task processor scan pending_rewrite=%s pending_title=%s pending_huasheng_create=%s pending_huasheng_progress=%s inflight_rewrite=%s inflight_title=%s inflight_huasheng_create=%s inflight_huasheng_progress=%s rewrite_slots=%s title_slots=%s huasheng_create_slots=%s huasheng_progress_slots=%s executor_size=%s",
                 len(rewrite_task_ids),
                 len(title_task_ids),
                 len(huasheng_create_task_ids),
@@ -1576,6 +1758,10 @@ class AccountService:
                 inflight_title,
                 inflight_huasheng_create,
                 inflight_huasheng_progress,
+                rewrite_slots,
+                title_slots,
+                huasheng_create_slots,
+                huasheng_progress_slots,
                 executor_size,
             )
 
@@ -1585,14 +1771,14 @@ class AccountService:
         huasheng_progress_submitted = 0
 
         if has_model_connection:
-            for task_id in rewrite_task_ids:
+            for task_id in rewrite_task_ids[:rewrite_slots]:
                 if self.submit_rewrite_task(task_id):
                     rewrite_submitted += 1
         elif self.list_pending_rewrite_task_ids():
             logger.debug("Task processor skipped rewrite because model connection settings are incomplete")
 
         if has_model_connection and str(model_settings.get("titlePrompt") or "").strip():
-            for task_id in title_task_ids:
+            for task_id in title_task_ids[:title_slots]:
                 if self.submit_title_task(task_id):
                     title_submitted += 1
         elif has_model_connection and title_task_ids:
@@ -1603,11 +1789,11 @@ class AccountService:
         elif not has_model_connection and self.list_pending_title_task_ids():
             logger.debug("Task processor skipped title generation because model connection settings are incomplete")
 
-        for task_id in huasheng_create_task_ids:
+        for task_id in huasheng_create_task_ids[:huasheng_create_slots]:
             if self.submit_huasheng_create_task(task_id):
                 huasheng_create_submitted += 1
 
-        for task_id in huasheng_progress_task_ids:
+        for task_id in huasheng_progress_task_ids[:huasheng_progress_slots]:
             if self.submit_huasheng_progress_task(task_id):
                 huasheng_progress_submitted += 1
 
@@ -1664,7 +1850,9 @@ class AccountService:
             query = (
                 TaskRecord.select(TaskRecord.id)
                 .where(
-                    TaskRecord.status == TASK_STATUS_READY_FOR_HUASHENG,
+                    TaskRecord.status.in_(
+                        [TASK_STATUS_READY_FOR_HUASHENG, TASK_STATUS_READY_FOR_VIDEO]
+                    ),
                     TaskRecord.article_id.is_null(False),
                     TaskRecord.rewritten_content != "",
                     TaskRecord.title != "",
@@ -1754,7 +1942,14 @@ class AccountService:
             return False
 
         try:
-            self.update_task_status(normalized_task_id, TASK_STATUS_HUASHENG_CREATING)
+            task = self.find_task_record(normalized_task_id)
+            if task is None:
+                self._unmark_task_inflight(normalized_task_id, stage=TASK_STAGE_HUASHENG_CREATE)
+                return False
+            self.update_task_status(
+                normalized_task_id,
+                self.get_task_create_running_status(task),
+            )
             future = self.get_task_executor().submit(
                 self._run_huasheng_create_task,
                 normalized_task_id,
@@ -2175,6 +2370,9 @@ class AccountService:
             "accountId": task.account_id,
             "accountPhone": task.account_phone,
             "accountNote": task.account_note,
+            "generationProvider": self.normalize_generation_provider(
+                getattr(task, "generation_provider", GENERATION_PROVIDER_HUASHENG)
+            ),
             "projectPid": task.project_pid,
             "articleId": task.article_id,
             "articlePreview": article_preview or str(task.article_content or "").strip(),
@@ -2204,6 +2402,33 @@ class AccountService:
         if account is None:
             raise ValueError("请先至少添加一个花生账号。")
         return account
+
+    def get_default_task_account_snapshot(self, *, generation_provider: str) -> dict[str, Any]:
+        normalized_provider = self.normalize_generation_provider(generation_provider)
+        if normalized_provider == GENERATION_PROVIDER_AUTOVIDEO:
+            return {
+                "accountId": 0,
+                "phone": "",
+                "note": "AutoVideo",
+                "cookies": "",
+            }
+        account = self.get_default_task_account()
+        return self.build_account_snapshot(account)
+
+    def get_task_generation_provider(self, task: TaskRecord) -> str:
+        return self.normalize_generation_provider(
+            getattr(task, "generation_provider", GENERATION_PROVIDER_HUASHENG)
+        )
+
+    def get_task_ready_for_generation_status(self, task: TaskRecord) -> str:
+        if self.get_task_generation_provider(task) == GENERATION_PROVIDER_AUTOVIDEO:
+            return TASK_STATUS_READY_FOR_VIDEO
+        return TASK_STATUS_READY_FOR_HUASHENG
+
+    def get_task_create_running_status(self, task: TaskRecord) -> str:
+        if self.get_task_generation_provider(task) == GENERATION_PROVIDER_AUTOVIDEO:
+            return TASK_STATUS_VIDEO_CREATING
+        return TASK_STATUS_HUASHENG_CREATING
 
     def build_account_snapshot(self, account: Account) -> dict[str, Any]:
         return {
@@ -2661,6 +2886,7 @@ class AccountService:
             "account_phone": '"account_phone" TEXT NOT NULL DEFAULT \'\'',
             "account_note": '"account_note" TEXT NOT NULL DEFAULT \'\'',
             "account_cookies": '"account_cookies" TEXT NOT NULL DEFAULT \'\'',
+            "generation_provider": '"generation_provider" TEXT NOT NULL DEFAULT \'huasheng\'',
             "article_id": '"article_id" INTEGER',
             "article_content": '"article_content" TEXT NOT NULL DEFAULT \'\'',
             "rewritten_content": '"rewritten_content" TEXT NOT NULL DEFAULT \'\'',
@@ -2698,6 +2924,7 @@ class AccountService:
               "account_phone" TEXT NOT NULL DEFAULT '',
               "account_note" TEXT NOT NULL DEFAULT '',
               "account_cookies" TEXT NOT NULL DEFAULT '',
+              "generation_provider" TEXT NOT NULL DEFAULT 'huasheng',
               "project_pid" VARCHAR(64) NOT NULL DEFAULT '',
               "article_id" INTEGER,
               "article_content" TEXT NOT NULL DEFAULT '',
@@ -2724,6 +2951,7 @@ class AccountService:
               "account_phone",
               "account_note",
               "account_cookies",
+              "generation_provider",
               "project_pid",
               "article_id",
               "article_content",
@@ -2746,6 +2974,7 @@ class AccountService:
               COALESCE("account_phone", ''),
               COALESCE("account_note", ''),
               COALESCE("account_cookies", ''),
+              'huasheng',
               CASE
                 WHEN TRIM(COALESCE("project_pid", '')) IN ('', '0') THEN ''
                 ELSE TRIM("project_pid")
@@ -2837,7 +3066,24 @@ class AccountService:
             "scanIntervalSeconds": TASK_QUEUE_SCAN_INTERVAL_SECONDS,
             "threadPoolMinSize": TASK_THREAD_POOL_MIN_SIZE,
             "threadPoolMaxSize": TASK_THREAD_POOL_MAX_SIZE,
+            "executorThreadPoolMaxSize": TASK_EXECUTOR_THREAD_POOL_MAX_SIZE,
             "processorRunning": self.is_task_processor_running(),
+            "databasePath": str(self.db_path),
+            "updatedAt": (
+                updated_at.isoformat(sep=" ", timespec="seconds") if updated_at else ""
+            ),
+        }
+
+    def build_autovideo_settings_payload(
+        self,
+        settings: dict[str, Any],
+        *,
+        updated_at: datetime | None,
+    ) -> dict[str, Any]:
+        return {
+            "settings": settings,
+            "voiceOptions": self._autovideo.list_voice_options(),
+            "rateOptions": self._autovideo.list_rate_options(),
             "databasePath": str(self.db_path),
             "updatedAt": (
                 updated_at.isoformat(sep=" ", timespec="seconds") if updated_at else ""
@@ -2860,6 +3106,9 @@ class AccountService:
 
     def default_huasheng_voice_settings(self) -> dict[str, Any]:
         return self.normalize_huasheng_voice_settings(DEFAULT_HUASHENG_VOICE_SETTINGS)
+
+    def default_autovideo_settings(self) -> dict[str, Any]:
+        return self.normalize_autovideo_settings(DEFAULT_AUTOVIDEO_SETTINGS)
 
     def deserialize_setting_value(self, raw_value: str) -> dict[str, Any]:
         normalized = str(raw_value or "").strip()
@@ -2923,14 +3172,78 @@ class AccountService:
         }
 
     def normalize_global_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        has_legacy_thread_pool_size = settings.get("threadPoolSize") is not None
+        legacy_thread_pool_size = self.normalize_thread_pool_size(
+            settings.get(
+                "threadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["rewriteThreadPoolSize"],
+            )
+        )
+        rewrite_thread_pool_size = self.normalize_thread_pool_size(
+            settings.get(
+                "rewriteThreadPoolSize",
+                legacy_thread_pool_size
+                if has_legacy_thread_pool_size
+                else DEFAULT_GLOBAL_SETTINGS["rewriteThreadPoolSize"],
+            )
+        )
+        title_thread_pool_size = self.normalize_thread_pool_size(
+            settings.get(
+                "titleThreadPoolSize",
+                legacy_thread_pool_size
+                if has_legacy_thread_pool_size
+                else DEFAULT_GLOBAL_SETTINGS["titleThreadPoolSize"],
+            )
+        )
+        create_thread_pool_size = self.normalize_thread_pool_size(
+            settings.get(
+                "createThreadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["createThreadPoolSize"],
+            )
+        )
+        progress_thread_pool_size = self.normalize_thread_pool_size(
+            settings.get(
+                "progressThreadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["progressThreadPoolSize"],
+            )
+        )
         return {
-            "threadPoolSize": self.normalize_thread_pool_size(
-                settings.get("threadPoolSize")
+            "threadPoolSize": self.normalize_executor_thread_pool_size(
+                rewrite_thread_pool_size
+                + title_thread_pool_size
+                + create_thread_pool_size
+                + progress_thread_pool_size
             ),
             "downloadDir": self.normalize_download_directory(
                 settings.get("downloadDir")
             ),
+            "generationProvider": self.normalize_generation_provider(
+                settings.get("generationProvider")
+            ),
+            "autoDownloadVideos": self.normalize_boolean_flag(
+                settings.get("autoDownloadVideos"),
+                default=bool(DEFAULT_GLOBAL_SETTINGS["autoDownloadVideos"]),
+            ),
+            "autoDeleteRedlineTasks": self.normalize_boolean_flag(
+                settings.get("autoDeleteRedlineTasks"),
+                default=bool(DEFAULT_GLOBAL_SETTINGS["autoDeleteRedlineTasks"]),
+            ),
+            "rewriteThreadPoolSize": rewrite_thread_pool_size,
+            "titleThreadPoolSize": title_thread_pool_size,
+            "createThreadPoolSize": create_thread_pool_size,
+            "progressThreadPoolSize": progress_thread_pool_size,
         }
+
+    def normalize_generation_provider(self, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == GENERATION_PROVIDER_AUTOVIDEO:
+            return GENERATION_PROVIDER_AUTOVIDEO
+        return GENERATION_PROVIDER_HUASHENG
+
+    def get_current_generation_provider(self) -> str:
+        return self.normalize_generation_provider(
+            self.get_global_settings_payload()["settings"].get("generationProvider")
+        )
 
     def normalize_thread_pool_size(self, value: Any) -> int:
         try:
@@ -2942,6 +3255,18 @@ class AccountService:
             return TASK_THREAD_POOL_MIN_SIZE
         if normalized > TASK_THREAD_POOL_MAX_SIZE:
             return TASK_THREAD_POOL_MAX_SIZE
+        return normalized
+
+    def normalize_executor_thread_pool_size(self, value: Any) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = DEFAULT_GLOBAL_SETTINGS["threadPoolSize"]
+
+        if normalized < TASK_THREAD_POOL_MIN_SIZE:
+            return TASK_THREAD_POOL_MIN_SIZE
+        if normalized > TASK_EXECUTOR_THREAD_POOL_MAX_SIZE:
+            return TASK_EXECUTOR_THREAD_POOL_MAX_SIZE
         return normalized
 
     def normalize_download_directory(self, value: Any) -> str:
@@ -3017,6 +3342,19 @@ class AccountService:
             ),
         }
 
+    def normalize_autovideo_settings(
+        self,
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        voice_choice = self._autovideo.normalize_voice_choice(settings.get("voiceChoice"))
+        rate_choice = self._autovideo.normalize_rate_choice(settings.get("rateChoice"))
+        return {
+            "voiceChoice": voice_choice,
+            "voiceLabel": self._autovideo.resolve_voice_label(voice_choice),
+            "rateChoice": rate_choice,
+            "rateLabel": self._autovideo.resolve_rate_label(rate_choice),
+        }
+
     def normalize_huasheng_max_concurrent_tasks(self, value: Any) -> int:
         try:
             normalized = int(value)
@@ -3049,6 +3387,11 @@ class AccountService:
         except (TypeError, ValueError):
             return 0
         return normalized if normalized > 0 else 0
+
+    def normalize_task_account_id(self, value: Any) -> int:
+        if value is None or value == "" or value == 0 or value == "0":
+            return 0
+        return self.normalize_positive_int(value, field_name="account_id")
 
     def normalize_positive_int_list(
         self,
@@ -3190,7 +3533,14 @@ class AccountService:
                 return next_candidate
             index += 1
 
-    def _download_video_to_path(self, video_url: str, target_path: Path) -> None:
+    def _download_video_to_path(
+        self,
+        video_url: str,
+        target_path: Path,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        task_id: int | None = None,
+    ) -> None:
         request = Request(
             str(video_url),
             headers={
@@ -3200,15 +3550,69 @@ class AccountService:
             method="GET",
         )
         with urlopen(request, timeout=VIDEO_DOWNLOAD_TIMEOUT) as response:
+            total_bytes = self._parse_download_content_length(
+                getattr(response, "headers", None)
+            )
+            downloaded_bytes = 0
+            last_reported_progress = -1
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "taskId": int(task_id or 0),
+                        "downloadedBytes": 0,
+                        "totalBytes": total_bytes,
+                        "progressPercent": 0 if total_bytes else None,
+                    }
+                )
             with target_path.open("wb") as output_file:
                 while True:
                     chunk = response.read(VIDEO_DOWNLOAD_CHUNK_SIZE)
                     if not chunk:
                         break
                     output_file.write(chunk)
+                    downloaded_bytes += len(chunk)
+                    if progress_callback is None:
+                        continue
+                    progress_percent = None
+                    if total_bytes and total_bytes > 0:
+                        progress_percent = min(
+                            99,
+                            max(0, int(downloaded_bytes * 100 / total_bytes)),
+                        )
+                    if progress_percent is not None and progress_percent == last_reported_progress:
+                        continue
+                    last_reported_progress = (
+                        progress_percent
+                        if progress_percent is not None
+                        else last_reported_progress
+                    )
+                    progress_callback(
+                        {
+                            "taskId": int(task_id or 0),
+                            "downloadedBytes": downloaded_bytes,
+                            "totalBytes": total_bytes,
+                            "progressPercent": progress_percent,
+                        }
+                    )
 
         if not target_path.exists() or target_path.stat().st_size <= 0:
             raise RuntimeError("下载结果为空文件。")
+
+    def _parse_download_content_length(self, headers: Any) -> int | None:
+        if headers is None:
+            return None
+        raw_value = None
+        try:
+            raw_value = headers.get("Content-Length")
+        except Exception:
+            raw_value = None
+        if raw_value in (None, ""):
+            return None
+        try:
+            total_bytes = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        return total_bytes if total_bytes > 0 else None
 
     def normalize_model_base_url(self, value: Any) -> str:
         normalized = self.normalize_required_text_field(
@@ -3312,7 +3716,7 @@ class AccountService:
         logger.info("Task processor scanner stopped")
 
     def _ensure_task_executor_locked(self, thread_pool_size: int) -> None:
-        normalized_size = self.normalize_thread_pool_size(thread_pool_size)
+        normalized_size = self.normalize_executor_thread_pool_size(thread_pool_size)
         if self._task_executor is not None and self._task_executor_size == normalized_size:
             return
         self._task_executor = ThreadPoolExecutor(
@@ -3453,6 +3857,14 @@ class AccountService:
                 task_id=task_id,
             )
             if payload.get("triggeredRedline"):
+                global_settings = self.get_global_settings_payload()["settings"]
+                if bool(global_settings.get("autoDeleteRedlineTasks")):
+                    self.delete_task_record(task_id)
+                    logger.info(
+                        "Task rewrite blocked by redline and deleted automatically task_id=%s",
+                        task_id,
+                    )
+                    return
                 try:
                     self.update_task_status(
                         task_id,
@@ -3550,10 +3962,11 @@ class AccountService:
                 title_prompt,
                 rewritten_content,
             )
+            next_status = self.get_task_ready_for_generation_status(task)
             try:
                 self.update_task_status(
                     task_id,
-                    TASK_STATUS_READY_FOR_HUASHENG,
+                    next_status,
                     title=payload["title"],
                 )
             except Exception as status_error:
@@ -3568,7 +3981,7 @@ class AccountService:
                 "Task title completed task_id=%s title_length=%s next_status=%s",
                 task_id,
                 len(str(payload.get("title") or "")),
-                TASK_STATUS_READY_FOR_HUASHENG,
+                next_status,
             )
 
         try:
@@ -3607,6 +4020,9 @@ class AccountService:
             task = self.find_task_record(task_id)
             if task is None:
                 logger.info("Task huasheng-create skipped because task was deleted task_id=%s", task_id)
+                return
+            if self.get_task_generation_provider(task) == GENERATION_PROVIDER_AUTOVIDEO:
+                self._run_autovideo_create_task(task)
                 return
 
             rewritten_content = str(task.rewritten_content or "").strip()
@@ -3724,6 +4140,58 @@ class AccountService:
                     return
                 raise
             raise RuntimeError(str(exc)) from exc
+
+    def _run_autovideo_create_task(self, task: TaskRecord) -> None:
+        rewritten_content = str(task.rewritten_content or "").strip()
+        title = str(task.title or "").strip()
+        if not rewritten_content:
+            raise ValueError("任务还没有改写内容，无法生成视频。")
+        if not title:
+            raise ValueError("任务还没有标题，无法生成视频。")
+
+        autovideo_settings = self.get_autovideo_settings_payload()["settings"]
+        logger.info(
+            "Task autovideo-create started task_id=%s voice_choice=%s rate_choice=%s title_length=%s content_length=%s",
+            task.id,
+            autovideo_settings["voiceChoice"],
+            autovideo_settings["rateChoice"],
+            len(title),
+            len(rewritten_content),
+        )
+        payload = self._autovideo.generate_video(
+            story_text=rewritten_content,
+            voice_choice=autovideo_settings["voiceChoice"],
+            rate_choice=autovideo_settings["rateChoice"],
+        )
+        try:
+            self.update_task_status(
+                int(task.id),
+                TASK_STATUS_EXPORT_FINISHED,
+                str(payload.get("eventId") or ""),
+                progress=100,
+                video_url=str(payload.get("viewUrl") or ""),
+                huasheng_status=str(payload.get("statusMessage") or "AutoVideo 生成完成"),
+                account_id=0,
+                account_phone="",
+                account_note="AutoVideo",
+                account_cookies="",
+                export_task_id="",
+                export_version="",
+            )
+        except Exception as status_error:
+            if self._is_missing_task_error(status_error):
+                logger.info(
+                    "Task autovideo-create result discarded because task was deleted task_id=%s",
+                    task.id,
+                )
+                return
+            raise
+        logger.info(
+            "Task autovideo-create completed task_id=%s event_id=%s has_video_url=%s",
+            task.id,
+            str(payload.get("eventId") or ""),
+            bool(str(payload.get("viewUrl") or "").strip()),
+        )
 
     def _run_huasheng_progress_task(self, task_id: int) -> None:
         def run_once() -> None:
@@ -4511,6 +4979,14 @@ class AccountService:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         return "\n".join(lines).strip()
+
+    def _strip_rewrite_markdown_chars(self, text: str) -> str:
+        normalized = str(text or "")
+        normalized = normalized.replace("*", "").replace("#", "")
+        normalized = "\n".join(line.strip() for line in normalized.splitlines())
+        normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
 
     def _build_model_authorization_header(self, api_key: str) -> str:
         normalized = str(api_key or "").strip()

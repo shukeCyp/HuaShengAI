@@ -137,15 +137,64 @@ class AppApiModelActionTests(unittest.TestCase):
             "save_global_settings",
             return_value={
                 "settings": {
-                    "threadPoolSize": 6,
+                    "threadPoolSize": 10,
                     "downloadDir": "/tmp/downloads",
+                    "generationProvider": "autovideo",
+                    "autoDownloadVideos": True,
+                    "autoDeleteRedlineTasks": True,
+                    "rewriteThreadPoolSize": 4,
+                    "titleThreadPoolSize": 3,
+                    "createThreadPoolSize": 2,
+                    "progressThreadPoolSize": 1,
                 }
             },
         ) as mocked_save:
-            payload = self.api.save_global_settings(6, "/tmp/downloads")
+            payload = self.api.save_global_settings(
+                10,
+                "/tmp/downloads",
+                "autovideo",
+                True,
+                True,
+                4,
+                3,
+                2,
+                1,
+            )
 
-        mocked_save.assert_called_once_with(6, "/tmp/downloads")
+        mocked_save.assert_called_once_with(
+            10,
+            "/tmp/downloads",
+            "autovideo",
+            True,
+            True,
+            4,
+            3,
+            2,
+            1,
+        )
         self.assertEqual(payload["settings"]["downloadDir"], "/tmp/downloads")
+        self.assertEqual(payload["settings"]["generationProvider"], "autovideo")
+        self.assertTrue(payload["settings"]["autoDownloadVideos"])
+        self.assertTrue(payload["settings"]["autoDeleteRedlineTasks"])
+
+    def test_save_autovideo_settings_delegates_to_service(self) -> None:
+        with patch.object(
+            self.service,
+            "save_autovideo_settings",
+            return_value={
+                "settings": {
+                    "voiceChoice": "zh-CN-YunyangNeural",
+                    "rateChoice": "+20%",
+                }
+            },
+        ) as mocked_save:
+            payload = self.api.save_autovideo_settings(
+                "zh-CN-YunyangNeural",
+                "+20%",
+            )
+
+        mocked_save.assert_called_once_with("zh-CN-YunyangNeural", "+20%")
+        self.assertEqual(payload["settings"]["voiceChoice"], "zh-CN-YunyangNeural")
 
     def test_save_huasheng_voice_settings_delegates_to_service_with_concurrency_limit(self) -> None:
         with patch.object(

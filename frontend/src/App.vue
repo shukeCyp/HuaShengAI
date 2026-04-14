@@ -21,8 +21,15 @@ const DEFAULT_MODEL_SETTINGS = {
   titlePrompt: ''
 }
 const DEFAULT_GLOBAL_SETTINGS = {
-  threadPoolSize: 3,
+  threadPoolSize: 8,
   downloadDir: '',
+  generationProvider: 'huasheng',
+  autoDownloadVideos: false,
+  autoDeleteRedlineTasks: false,
+  rewriteThreadPoolSize: 3,
+  titleThreadPoolSize: 3,
+  createThreadPoolSize: 1,
+  progressThreadPoolSize: 1
 }
 const DEFAULT_HUASHENG_VOICE_SETTINGS = {
   voiceId: 0,
@@ -33,6 +40,12 @@ const DEFAULT_HUASHENG_VOICE_SETTINGS = {
   cover: '',
   speechRate: 1,
   maxConcurrentTasksPerAccount: 1
+}
+const DEFAULT_AUTOVIDEO_SETTINGS = {
+  voiceChoice: 'zh-CN-YunyangNeural',
+  voiceLabel: '云扬（中文男声，新闻播报）',
+  rateChoice: '+20%',
+  rateLabel: '较快（1.2x）'
 }
 const DEFAULT_SUBTITLE_FONT_SIZE_OPTIONS = [
   { label: '超小号', value: 22 },
@@ -125,6 +138,7 @@ const visitedDebugTabs = reactive({
 const visitedSettingsTabs = reactive({
   global: false,
   huasheng: true,
+  autovideo: false,
   microheadline: false,
   model: false
 })
@@ -150,6 +164,8 @@ const taskDeleteDialogOpen = ref(false)
 const taskDeleteLoading = ref(false)
 const taskRecords = ref([])
 const downloadingTaskIds = ref([])
+const taskDownloadProgressMap = ref({})
+const autoDownloadTaskIds = ref([])
 const retryingTaskIds = ref([])
 const deletingTaskIds = ref([])
 const currentProjectTaskRecordId = ref(null)
@@ -212,6 +228,15 @@ const huashengVoiceSettings = reactive({
 })
 const globalSettings = reactive({
   ...DEFAULT_GLOBAL_SETTINGS
+})
+const autovideoSettingsLoading = ref(false)
+const autovideoSettingsSaving = ref(false)
+const autovideoSettingsLoaded = ref(false)
+const autovideoSettingsLastSavedAt = ref('')
+const autovideoVoiceOptions = ref([])
+const autovideoRateOptions = ref([])
+const autovideoSettings = reactive({
+  ...DEFAULT_AUTOVIDEO_SETTINGS
 })
 const modelSettings = reactive({
   ...DEFAULT_MODEL_SETTINGS
@@ -319,12 +344,17 @@ const settingsTabs = [
   {
     key: 'global',
     label: '全局设置',
-    description: '线程池大小与后台任务扫描'
+    description: '生成渠道、线程池和后台任务扫描'
   },
   {
     key: 'huasheng',
     label: '花生设置',
     description: '字幕字号、字幕样式和默认音色'
+  },
+  {
+    key: 'autovideo',
+    label: 'AutoVideo',
+    description: '发音人和语速'
   },
   {
     key: 'model',
@@ -364,6 +394,8 @@ const debugAccountPool = computed(() => {
   return enabledAccounts.length ? enabledAccounts : accounts.value
 })
 
+const isUsingAutoVideo = computed(() => globalSettings.generationProvider === 'autovideo')
+
 const selectedProjectAccount = computed(() => {
   return accounts.value.find((account) => String(account.id) === String(projectForm.accountId)) ?? null
 })
@@ -379,6 +411,9 @@ const projectBusy = computed(() => {
 })
 
 const canCreateProject = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return desktopReady.value && Boolean(String(projectForm.script || '').trim()) && !projectBusy.value
+  }
   return (
     desktopReady.value &&
     Boolean(selectedProjectAccount.value?.cookies?.trim()) &&
@@ -393,6 +428,12 @@ const projectValidationMessage = computed(() => {
   }
   if (projectBusy.value) {
     return '任务正在处理中，请等待完成'
+  }
+  if (isUsingAutoVideo.value) {
+    if (!String(projectForm.script || '').trim()) {
+      return '请先输入分镜脚本'
+    }
+    return '参数已就绪，可以直接生成视频'
   }
   if (!selectedProjectAccount.value?.cookies?.trim()) {
     return '请先选择发布账号'
@@ -411,14 +452,23 @@ const projectProgressValue = computed(() => {
 })
 
 const projectStateText = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return projectResult.value?.statusMessage || '等待生成'
+  }
   return projectPayload.value?.state_message || projectPayload.value?.loading_msg || '等待创建'
 })
 
 const projectDisplayId = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return projectResult.value?.eventId || '--'
+  }
   return projectPayload.value?.id || projectResult.value?.id || '--'
 })
 
 const projectDisplayPid = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return projectResult.value?.eventId || '--'
+  }
   return projectPayload.value?.pid || projectResult.value?.pid || '--'
 })
 
@@ -431,16 +481,32 @@ const projectExportVersion = computed(() => {
 })
 
 const projectExportProgressValue = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return projectResult.value?.video?.url ? 100 : 0
+  }
   const value = Number(projectExportInfo.value?.progress ?? 0)
   return Number.isFinite(value) ? value : 0
 })
 
 const projectExportUrl = computed(() => {
+  if (isUsingAutoVideo.value) {
+    const url = projectResult.value?.video?.url
+    return typeof url === 'string' ? url.trim() : ''
+  }
   const url = projectExportInfo.value?.url
   return typeof url === 'string' ? url.trim() : ''
 })
 
 const projectExportStateText = computed(() => {
+  if (isUsingAutoVideo.value) {
+    if (projectLoading.value) {
+      return '生成中'
+    }
+    if (projectExportUrl.value) {
+      return '生成完成'
+    }
+    return '未开始生成'
+  }
   if (!projectExportTask.value?.task_id) {
     return '未开始导出'
   }
@@ -462,6 +528,9 @@ const projectCanView = computed(() => {
 })
 
 const projectIsFinished = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return Boolean(projectExportUrl.value)
+  }
   if (!projectResult.value?.pid && projectDisplayPid.value === '--') {
     return false
   }
@@ -470,6 +539,9 @@ const projectIsFinished = computed(() => {
 })
 
 const projectCanExport = computed(() => {
+  if (isUsingAutoVideo.value) {
+    return false
+  }
   return (
     desktopReady.value &&
     Boolean(selectedProjectAccount.value?.cookies?.trim()) &&
@@ -481,7 +553,10 @@ const projectCanExport = computed(() => {
 
 const projectCurrentStageLabel = computed(() => {
   if (projectLoading.value) {
-    return '创建中...'
+    return isUsingAutoVideo.value ? '生成中...' : '创建中...'
+  }
+  if (isUsingAutoVideo.value) {
+    return projectCanView.value ? '可查看' : '等待生成'
   }
   if (projectPolling.value) {
     return '处理中'
@@ -513,6 +588,9 @@ const projectCurrentStageLabel = computed(() => {
 const projectStatusSummary = computed(() => {
   if (projectBusy.value) {
     return statusMessage.value
+  }
+  if (isUsingAutoVideo.value) {
+    return projectCanView.value ? '视频已生成，可直接查看或复制链接' : projectValidationMessage.value
   }
   if (projectCanView.value) {
     return '导出完成，可直接查看成片'
@@ -598,7 +676,15 @@ const huashengVoiceSummary = computed(() => {
 
 const globalSettingsSummary = computed(() => {
   const downloadLabel = globalSettings.downloadDir ? '已设置下载目录' : '未设置下载目录'
-  return `线程池 ${Number(globalSettings.threadPoolSize || DEFAULT_GLOBAL_SETTINGS.threadPoolSize)} 个线程 · ${downloadLabel}`
+  const providerLabel = isUsingAutoVideo.value ? 'AutoVideo' : '花生'
+  const autoDownloadLabel = globalSettings.autoDownloadVideos ? '自动下载已开启' : '自动下载已关闭'
+  const redlineLabel = globalSettings.autoDeleteRedlineTasks ? '红线自动删除' : '红线保留任务'
+  const stageLabel = `S1 ${normalizeGlobalStageThreadPoolSize(globalSettings.rewriteThreadPoolSize)} / S2 ${normalizeGlobalStageThreadPoolSize(globalSettings.titleThreadPoolSize)} / S3 ${normalizeGlobalStageThreadPoolSize(globalSettings.createThreadPoolSize)} / S4 ${normalizeGlobalStageThreadPoolSize(globalSettings.progressThreadPoolSize)}`
+  return `${providerLabel} · 总线程 ${getGlobalExecutorThreadPoolSize(globalSettings)} · ${stageLabel} · ${downloadLabel} · ${autoDownloadLabel} · ${redlineLabel}`
+})
+
+const autovideoSettingsSummary = computed(() => {
+  return `${getAutovideoVoiceLabel(autovideoSettings.voiceChoice)} · ${getAutovideoRateLabel(autovideoSettings.rateChoice)}`
 })
 
 const logStatusSummary = computed(() => {
@@ -722,6 +808,7 @@ function switchSection(section) {
     desktopReady.value &&
     !subtitleSettingsLoading.value &&
     !huashengVoiceSettingsLoading.value &&
+    !autovideoSettingsLoading.value &&
     !globalSettingsLoading.value &&
     !modelSettingsLoading.value
   ) {
@@ -733,6 +820,9 @@ function switchSection(section) {
     }
     if (!huashengVoiceSettingsLoaded.value) {
       loadHuashengVoiceSettings('音色设置已加载')
+    }
+    if (!autovideoSettingsLoaded.value) {
+      loadAutovideoSettings('AutoVideo 设置已加载')
     }
     if (!modelSettingsLoaded.value) {
       loadModelSettings('模型设置已加载')
@@ -767,7 +857,10 @@ function activateSettingsTab(tabKey) {
   }
   if (tabKey === 'huasheng' && desktopReady.value && !huashengVoiceSettingsLoaded.value) {
     loadHuashengVoiceSettings('音色设置已加载')
-  }
+  }
+  if (tabKey === 'autovideo' && desktopReady.value && !autovideoSettingsLoaded.value) {
+    loadAutovideoSettings('AutoVideo 设置已加载')
+  }
   if (tabKey === 'model' && desktopReady.value && !modelSettingsLoaded.value) {
     loadModelSettings('模型设置已加载')
   }
@@ -826,6 +919,10 @@ function isTaskDownloading(taskId) {
   return downloadingTaskIds.value.includes(Number(taskId) || 0)
 }
 
+function isTaskAutoDownloading(taskId) {
+  return autoDownloadTaskIds.value.includes(Number(taskId) || 0)
+}
+
 function isTaskRetrying(taskId) {
   return retryingTaskIds.value.includes(Number(taskId) || 0)
 }
@@ -848,6 +945,60 @@ function setTaskDownloading(taskId, downloading) {
   }
 
   downloadingTaskIds.value = downloadingTaskIds.value.filter((item) => item !== normalizedTaskId)
+  const nextProgressMap = { ...taskDownloadProgressMap.value }
+  delete nextProgressMap[normalizedTaskId]
+  taskDownloadProgressMap.value = nextProgressMap
+}
+
+function setTaskAutoDownloading(taskId, downloading) {
+  const normalizedTaskId = Number(taskId) || 0
+  if (normalizedTaskId <= 0) {
+    return
+  }
+
+  if (downloading) {
+    if (!autoDownloadTaskIds.value.includes(normalizedTaskId)) {
+      autoDownloadTaskIds.value = [...autoDownloadTaskIds.value, normalizedTaskId]
+    }
+    return
+  }
+
+  autoDownloadTaskIds.value = autoDownloadTaskIds.value.filter((item) => item !== normalizedTaskId)
+}
+
+function setTaskDownloadProgress(taskId, progressPercent) {
+  const normalizedTaskId = Number(taskId) || 0
+  if (normalizedTaskId <= 0) {
+    return
+  }
+  const normalizedProgress = Number(progressPercent)
+  const nextProgressMap = { ...taskDownloadProgressMap.value }
+  if (!Number.isFinite(normalizedProgress) || normalizedProgress < 0) {
+    delete nextProgressMap[normalizedTaskId]
+  } else {
+    nextProgressMap[normalizedTaskId] = Math.max(0, Math.min(100, Math.round(normalizedProgress)))
+  }
+  taskDownloadProgressMap.value = nextProgressMap
+}
+
+function getTaskDownloadProgress(taskId) {
+  const normalizedTaskId = Number(taskId) || 0
+  if (normalizedTaskId <= 0) {
+    return null
+  }
+  const progress = Number(taskDownloadProgressMap.value[normalizedTaskId])
+  return Number.isFinite(progress) ? progress : null
+}
+
+function getTaskDownloadButtonLabel(taskId) {
+  if (!isTaskDownloading(taskId)) {
+    return '下载'
+  }
+  const progress = getTaskDownloadProgress(taskId)
+  if (progress === null) {
+    return '下载中...'
+  }
+  return `下载 ${progress}%`
 }
 
 function setTaskRetrying(taskId, retrying) {
@@ -973,6 +1124,17 @@ function resolveHuashengVoiceSettings(rawSettings) {
   }
 }
 
+function resolveAutovideoSettings(rawSettings) {
+  const voiceChoice = String(rawSettings?.voiceChoice || DEFAULT_AUTOVIDEO_SETTINGS.voiceChoice)
+  const rateChoice = String(rawSettings?.rateChoice || DEFAULT_AUTOVIDEO_SETTINGS.rateChoice)
+  return {
+    voiceChoice,
+    voiceLabel: String(rawSettings?.voiceLabel || voiceChoice),
+    rateChoice,
+    rateLabel: String(rawSettings?.rateLabel || rateChoice)
+  }
+}
+
 function applySubtitleSettingsPayload(payload) {
   if (Array.isArray(payload?.fontSizeOptions) && payload.fontSizeOptions.length) {
     subtitleFontSizeOptions.value = payload.fontSizeOptions
@@ -989,6 +1151,27 @@ function applySubtitleSettingsPayload(payload) {
   subtitleSettings.outlineThick = settings.outlineThick
   subtitleSettingsLoaded.value = true
   subtitleLastSavedAt.value = String(payload?.updatedAt || '')
+
+  if (payload?.databasePath) {
+    databasePath.value = payload.databasePath
+  }
+}
+
+function applyAutovideoSettingsPayload(payload) {
+  if (Array.isArray(payload?.voiceOptions)) {
+    autovideoVoiceOptions.value = payload.voiceOptions
+  }
+  if (Array.isArray(payload?.rateOptions)) {
+    autovideoRateOptions.value = payload.rateOptions
+  }
+
+  const settings = resolveAutovideoSettings(payload?.settings || autovideoSettings)
+  autovideoSettings.voiceChoice = settings.voiceChoice
+  autovideoSettings.voiceLabel = settings.voiceLabel
+  autovideoSettings.rateChoice = settings.rateChoice
+  autovideoSettings.rateLabel = settings.rateLabel
+  autovideoSettingsLoaded.value = true
+  autovideoSettingsLastSavedAt.value = String(payload?.updatedAt || '')
 
   if (payload?.databasePath) {
     databasePath.value = payload.databasePath
@@ -1053,18 +1236,35 @@ function createRewritePromptItem(content = '', id = null) {
   }
 }
 
-function normalizeGlobalThreadPoolSize(value) {
+function normalizeGlobalStageThreadPoolSize(value, fallback = 1) {
   const normalized = Number(value)
   if (!Number.isFinite(normalized)) {
-    return DEFAULT_GLOBAL_SETTINGS.threadPoolSize
+    return Math.max(1, Math.min(32, Math.round(Number(fallback) || 1)))
   }
   return Math.max(1, Math.min(32, Math.round(normalized)))
+}
+
+function getGlobalExecutorThreadPoolSize(settings) {
+  return (
+    normalizeGlobalStageThreadPoolSize(settings?.rewriteThreadPoolSize, DEFAULT_GLOBAL_SETTINGS.rewriteThreadPoolSize) +
+    normalizeGlobalStageThreadPoolSize(settings?.titleThreadPoolSize, DEFAULT_GLOBAL_SETTINGS.titleThreadPoolSize) +
+    normalizeGlobalStageThreadPoolSize(settings?.createThreadPoolSize, DEFAULT_GLOBAL_SETTINGS.createThreadPoolSize) +
+    normalizeGlobalStageThreadPoolSize(settings?.progressThreadPoolSize, DEFAULT_GLOBAL_SETTINGS.progressThreadPoolSize)
+  )
 }
 
 function normalizeGlobalDownloadDir(value) {
   return String(value || '').trim()
 }
-
+
+function normalizeGenerationProvider(value) {
+  return String(value || '').trim() === 'autovideo' ? 'autovideo' : 'huasheng'
+}
+
+function normalizeBooleanFlag(value) {
+  return Boolean(value)
+}
+
 
 function normalizeHuashengMaxConcurrentTasks(value) {
   const normalized = Number(value)
@@ -1072,6 +1272,20 @@ function normalizeHuashengMaxConcurrentTasks(value) {
     return DEFAULT_HUASHENG_VOICE_SETTINGS.maxConcurrentTasksPerAccount
   }
   return Math.max(1, Math.min(50, Math.round(normalized)))
+}
+
+function getAutovideoVoiceLabel(value) {
+  return (
+    autovideoVoiceOptions.value.find((item) => item.value === String(value || ''))?.label ||
+    String(value || DEFAULT_AUTOVIDEO_SETTINGS.voiceLabel)
+  )
+}
+
+function getAutovideoRateLabel(value) {
+  return (
+    autovideoRateOptions.value.find((item) => item.value === String(value || ''))?.label ||
+    String(value || DEFAULT_AUTOVIDEO_SETTINGS.rateLabel)
+  )
 }
 
 function getPathTail(path) {
@@ -1178,8 +1392,27 @@ function applyModelSettingsPayload(payload) {
 
 function applyGlobalSettingsPayload(payload) {
   const settings = payload?.settings || {}
-  globalSettings.threadPoolSize = normalizeGlobalThreadPoolSize(settings.threadPoolSize)
+  globalSettings.rewriteThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+    settings.rewriteThreadPoolSize,
+    DEFAULT_GLOBAL_SETTINGS.rewriteThreadPoolSize
+  )
+  globalSettings.titleThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+    settings.titleThreadPoolSize,
+    DEFAULT_GLOBAL_SETTINGS.titleThreadPoolSize
+  )
+  globalSettings.createThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+    settings.createThreadPoolSize,
+    DEFAULT_GLOBAL_SETTINGS.createThreadPoolSize
+  )
+  globalSettings.progressThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+    settings.progressThreadPoolSize,
+    DEFAULT_GLOBAL_SETTINGS.progressThreadPoolSize
+  )
+  globalSettings.threadPoolSize = getGlobalExecutorThreadPoolSize(globalSettings)
   globalSettings.downloadDir = normalizeGlobalDownloadDir(settings.downloadDir)
+  globalSettings.generationProvider = normalizeGenerationProvider(settings.generationProvider)
+  globalSettings.autoDownloadVideos = normalizeBooleanFlag(settings.autoDownloadVideos)
+  globalSettings.autoDeleteRedlineTasks = normalizeBooleanFlag(settings.autoDeleteRedlineTasks)
   globalSettingsLoaded.value = true
   globalSettingsLastSavedAt.value = String(payload?.updatedAt || '')
 
@@ -1238,6 +1471,9 @@ async function loadGlobalSettings(message = '全局设置已加载') {
   try {
     const payload = await callDesktop('get_global_settings')
     applyGlobalSettingsPayload(payload)
+    if (globalSettings.generationProvider === 'autovideo' && !autovideoSettingsLoaded.value) {
+      await loadAutovideoSettings('AutoVideo 设置已加载')
+    }
     statusMessage.value = `${message} · ${globalSettingsSummary.value}`
     return payload
   } catch (error) {
@@ -1258,12 +1494,38 @@ async function saveGlobalSettings() {
   globalSettingsSaving.value = true
 
   try {
+    const rewriteThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+      globalSettings.rewriteThreadPoolSize,
+      DEFAULT_GLOBAL_SETTINGS.rewriteThreadPoolSize
+    )
+    const titleThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+      globalSettings.titleThreadPoolSize,
+      DEFAULT_GLOBAL_SETTINGS.titleThreadPoolSize
+    )
+    const createThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+      globalSettings.createThreadPoolSize,
+      DEFAULT_GLOBAL_SETTINGS.createThreadPoolSize
+    )
+    const progressThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+      globalSettings.progressThreadPoolSize,
+      DEFAULT_GLOBAL_SETTINGS.progressThreadPoolSize
+    )
     const payload = await callDesktop(
       'save_global_settings',
-      normalizeGlobalThreadPoolSize(globalSettings.threadPoolSize),
-      normalizeGlobalDownloadDir(globalSettings.downloadDir)
+      rewriteThreadPoolSize + titleThreadPoolSize + createThreadPoolSize + progressThreadPoolSize,
+      normalizeGlobalDownloadDir(globalSettings.downloadDir),
+      normalizeGenerationProvider(globalSettings.generationProvider),
+      normalizeBooleanFlag(globalSettings.autoDownloadVideos),
+      normalizeBooleanFlag(globalSettings.autoDeleteRedlineTasks),
+      rewriteThreadPoolSize,
+      titleThreadPoolSize,
+      createThreadPoolSize,
+      progressThreadPoolSize
     )
     applyGlobalSettingsPayload(payload)
+    if (globalSettings.generationProvider === 'autovideo' && !autovideoSettingsLoaded.value) {
+      await loadAutovideoSettings('AutoVideo 设置已加载')
+    }
     statusMessage.value = `全局设置已保存到数据库 · ${globalSettingsSummary.value}`
   } catch (error) {
     statusMessage.value = `保存全局设置失败: ${error instanceof Error ? error.message : String(error)}`
@@ -1835,6 +2097,10 @@ async function pollProjectExportUntilFinished(projectId, taskId, accountCookies)
 }
 
 async function refreshProjectProgress() {
+  if (isUsingAutoVideo.value) {
+    statusMessage.value = 'AutoVideo 为直出模式，无需手动刷新状态'
+    return
+  }
   const cookies = selectedProjectAccount.value?.cookies?.trim()
   if (!cookies) {
     statusMessage.value = '当前没有可刷新的任务进度'
@@ -1900,6 +2166,8 @@ function applyTaskPayload(payload) {
   taskRecords.value = [...(payload.items ?? [])].sort(
     (left, right) => Number(right?.id || 0) - Number(left?.id || 0)
   )
+  const existingTaskIds = new Set(taskRecords.value.map((task) => Number(task?.id || 0)).filter(Boolean))
+  autoDownloadTaskIds.value = autoDownloadTaskIds.value.filter((taskId) => existingTaskIds.has(taskId))
   if (payload?.databasePath) {
     databasePath.value = payload.databasePath
   }
@@ -1915,6 +2183,7 @@ async function loadTasks(message = '任务列表已同步', { silent = false } =
   try {
     const payload = await callDesktop('list_tasks')
     applyTaskPayload(payload)
+    await maybeAutoDownloadFinishedTasks()
     if (!silent) {
       statusMessage.value = message
     }
@@ -1953,6 +2222,40 @@ async function deleteAllTaskRecords() {
     statusMessage.value = `删除任务失败: ${error instanceof Error ? error.message : String(error)}`
   } finally {
     taskDeleteLoading.value = false
+  }
+}
+
+async function maybeAutoDownloadFinishedTasks() {
+  if (!desktopReady.value || !globalSettings.autoDownloadVideos) {
+    return
+  }
+  if (!normalizeGlobalDownloadDir(globalSettings.downloadDir)) {
+    return
+  }
+
+  const candidates = taskRecords.value.filter((task) => {
+    const taskId = Number(task?.id || 0)
+    return (
+      taskId > 0 &&
+      String(task?.status || '').trim() === '导出完成' &&
+      Boolean(String(task?.videoUrl || '').trim()) &&
+      !isTaskDownloading(taskId) &&
+      !isTaskAutoDownloading(taskId)
+    )
+  })
+
+  for (const task of candidates) {
+    const taskId = Number(task.id) || 0
+    if (taskId <= 0) {
+      continue
+    }
+    setTaskAutoDownloading(taskId, true)
+    try {
+      await callDesktop('start_download_task_video', taskId)
+    } catch (error) {
+      setTaskAutoDownloading(taskId, false)
+      statusMessage.value = `自动下载失败: ${error instanceof Error ? error.message : String(error)}`
+    }
   }
 }
 
@@ -2157,6 +2460,52 @@ async function loadHuashengVoiceSettings(message = '音色设置已加载') {
   }
 }
 
+async function loadAutovideoSettings(message = 'AutoVideo 设置已加载') {
+  if (!desktopReady.value) {
+    return null
+  }
+
+  autovideoSettingsLoading.value = true
+
+  try {
+    const payload = await callDesktop('get_autovideo_settings')
+    applyAutovideoSettingsPayload(payload)
+    statusMessage.value = `${message} · ${autovideoSettingsSummary.value}`
+    return payload
+  } catch (error) {
+    autovideoSettingsLoaded.value = false
+    statusMessage.value = `加载 AutoVideo 设置失败: ${error instanceof Error ? error.message : String(error)}`
+    return null
+  } finally {
+    autovideoSettingsLoading.value = false
+  }
+}
+
+async function saveAutovideoSettings() {
+  if (!desktopReady.value) {
+    statusMessage.value = '当前不在 PyWebView 环境内'
+    return null
+  }
+
+  autovideoSettingsSaving.value = true
+
+  try {
+    const payload = await callDesktop(
+      'save_autovideo_settings',
+      autovideoSettings.voiceChoice,
+      autovideoSettings.rateChoice
+    )
+    applyAutovideoSettingsPayload(payload)
+    statusMessage.value = `AutoVideo 设置已保存到数据库 · ${autovideoSettingsSummary.value}`
+    return payload
+  } catch (error) {
+    statusMessage.value = `保存 AutoVideo 设置失败: ${error instanceof Error ? error.message : String(error)}`
+    return null
+  } finally {
+    autovideoSettingsSaving.value = false
+  }
+}
+
 async function saveHuashengVoiceSettingsFromSelection() {
   if (!desktopReady.value) {
     statusMessage.value = '当前不在 PyWebView 环境内'
@@ -2272,6 +2621,11 @@ async function exportCurrentProject() {
 
   if (!desktopReady.value) {
     statusMessage.value = '当前不在 PyWebView 环境内'
+    return
+  }
+
+  if (isUsingAutoVideo.value) {
+    statusMessage.value = 'AutoVideo 生成完成后会直接返回成片，无需单独导出'
     return
   }
 
@@ -2675,6 +3029,12 @@ async function openSettingsVoicePicker() {
   })
 }
 
+function openAutovideoSettingsTab() {
+  setActiveSection('settings')
+  activateSettingsTab('autovideo')
+  statusMessage.value = '请在 AutoVideo 设置中选择发音人和语速'
+}
+
 function editAccount(account) {
   setActiveSection('accounts')
   form.id = account.id
@@ -2844,6 +3204,46 @@ async function createProjectTask() {
     return
   }
 
+  if (isUsingAutoVideo.value) {
+    const storyText = String(projectForm.script || '').trim()
+    if (!storyText) {
+      statusMessage.value = '请先输入分镜脚本'
+      return
+    }
+
+    stopProjectPolling()
+    currentProjectTaskRecordId.value = null
+    projectInfo.value = null
+    projectPollCount.value = 0
+    projectSubtitleResult.value = null
+    projectExportTask.value = null
+    projectExportInfo.value = null
+    projectExportPollCount.value = 0
+    projectLoading.value = true
+    statusMessage.value = '开始调用 AutoVideo 生成视频'
+
+    try {
+      const payload = await callDesktop(
+        'generate_autovideo_video',
+        storyText,
+        autovideoSettings.voiceChoice,
+        autovideoSettings.rateChoice
+      )
+      projectResult.value = payload
+      projectLastFetchAccount.value = null
+      projectLastFetchAt.value = new Date().toLocaleString('zh-CN', { hour12: false })
+      statusMessage.value = payload?.statusMessage
+        ? `AutoVideo 已完成 · ${payload.statusMessage}`
+        : 'AutoVideo 已生成完成'
+    } catch (error) {
+      projectResult.value = null
+      statusMessage.value = `AutoVideo 生成失败: ${error instanceof Error ? error.message : String(error)}`
+    } finally {
+      projectLoading.value = false
+    }
+    return
+  }
+
   if (!selectedProjectAccount.value?.cookies?.trim()) {
     statusMessage.value = '请先选择发布账号'
     return
@@ -2959,7 +3359,21 @@ async function handleDesktopEvent(event) {
     const taskId = Number(event.payload?.taskId || 0)
     if (taskId > 0) {
       setTaskDownloading(taskId, true)
+      setTaskDownloadProgress(taskId, event.payload?.progressPercent ?? 0)
       statusMessage.value = `任务 #${taskId} 开始下载视频，请稍候`
+    }
+    return
+  }
+
+  if (event.type === 'tasks.download.progress') {
+    const taskId = Number(event.payload?.taskId || 0)
+    if (taskId > 0) {
+      setTaskDownloading(taskId, true)
+      setTaskDownloadProgress(taskId, event.payload?.progressPercent)
+      const progress = getTaskDownloadProgress(taskId)
+      if (progress !== null) {
+        statusMessage.value = `任务 #${taskId} 下载中 ${progress}%`
+      }
     }
     return
   }
@@ -2967,7 +3381,9 @@ async function handleDesktopEvent(event) {
   if (event.type === 'tasks.download.finished') {
     const taskId = Number(event.payload?.taskId || 0)
     if (taskId > 0) {
+      setTaskDownloadProgress(taskId, 100)
       setTaskDownloading(taskId, false)
+      setTaskAutoDownloading(taskId, false)
     }
     await loadTasks('任务列表已同步', { silent: true })
     statusMessage.value = `视频已下载到 ${event.payload?.downloadPath || '--'}，任务已自动删除`
@@ -2978,6 +3394,7 @@ async function handleDesktopEvent(event) {
     const taskId = Number(event.payload?.taskId || 0)
     if (taskId > 0) {
       setTaskDownloading(taskId, false)
+      setTaskAutoDownloading(taskId, false)
     }
     statusMessage.value = `下载视频失败: ${event.payload?.errorMessage || '未知错误'}`
     return
@@ -3043,6 +3460,15 @@ watch(selectedTtsVoiceId, (value) => {
     projectForm.voiceId = Number(value)
   }
 })
+
+watch(
+  () => globalSettings.generationProvider,
+  async (value) => {
+    if (value === 'autovideo' && desktopReady.value && !autovideoSettingsLoaded.value && !autovideoSettingsLoading.value) {
+      await loadAutovideoSettings('AutoVideo 设置已加载')
+    }
+  }
+)
 </script>
 
 <template>
@@ -3299,7 +3725,7 @@ watch(selectedTtsVoiceId, (value) => {
                   :disabled="isTaskDownloading(task.id) || !desktopReady"
                   @click="downloadTaskVideo(task)"
                 >
-                  {{ isTaskDownloading(task.id) ? '下载中...' : '下载' }}
+                  {{ getTaskDownloadButtonLabel(task.id) }}
                 </button>
                 <span v-else class="task-download-placeholder">--</span>
               </span>
@@ -3550,12 +3976,19 @@ watch(selectedTtsVoiceId, (value) => {
             <article class="tts-lab project-lab">
               <div class="tts-lab-header">
                 <div>
-                  <p class="tts-caption">花生调试台</p>
+                  <p class="tts-caption">{{ isUsingAutoVideo ? 'AutoVideo 调试台' : '花生调试台' }}</p>
                   <h2>创建任务</h2>
-                  <p class="tts-description">先选择音色，再选择发布账号。创建任务后可单独点击导出按钮，系统会先设置字幕，再执行导出。</p>
+                  <p class="tts-description">
+                    {{
+                      isUsingAutoVideo
+                        ? '直接提交分镜脚本到 AutoVideo，系统会按设置页保存的发音人和语速直接生成成片。'
+                        : '先选择音色，再选择发布账号。创建任务后可单独点击导出按钮，系统会先设置字幕，再执行导出。'
+                    }}
+                  </p>
                 </div>
                 <div class="project-header-actions">
                   <button
+                    v-if="!isUsingAutoVideo"
                     type="button"
                     class="toolbar-button secondary project-export-button"
                     :disabled="!projectCanExport"
@@ -3569,18 +4002,38 @@ watch(selectedTtsVoiceId, (value) => {
                     :disabled="!canCreateProject"
                     @click="createProjectTask"
                   >
-                    {{ projectLoading ? '创建中...' : projectPolling ? '处理中...' : '发布创建任务' }}
+                    {{
+                      isUsingAutoVideo
+                        ? projectLoading
+                          ? '生成中...'
+                          : '生成视频'
+                        : projectLoading
+                          ? '创建中...'
+                          : projectPolling
+                            ? '处理中...'
+                            : '发布创建任务'
+                    }}
                   </button>
                 </div>
               </div>
 
               <div class="tts-account-strip">
-                <div class="tts-account-card">
+                <div v-if="isUsingAutoVideo" class="tts-account-card">
+                  <span>当前发音人</span>
+                  <strong>{{ getAutovideoVoiceLabel(autovideoSettings.voiceChoice) }}</strong>
+                  <small>{{ autovideoSettings.voiceChoice || '请先到设置页保存' }}</small>
+                </div>
+                <div v-if="isUsingAutoVideo" class="tts-account-card">
+                  <span>当前语速</span>
+                  <strong>{{ getAutovideoRateLabel(autovideoSettings.rateChoice) }}</strong>
+                  <small>{{ autovideoSettings.rateChoice || '请先到设置页保存' }}</small>
+                </div>
+                <div v-if="!isUsingAutoVideo" class="tts-account-card">
                   <span>当前 voice_id</span>
                   <strong>{{ projectForm.voiceId || '--' }}</strong>
                   <small>{{ selectedTtsVoice ? selectedTtsVoice.name : '未从音色页带入' }}</small>
                 </div>
-                <div class="tts-account-card">
+                <div v-if="!isUsingAutoVideo" class="tts-account-card">
                   <span>发布账号</span>
                   <strong>{{ selectedProjectAccount ? maskPhone(selectedProjectAccount.phone) : '请选择账号' }}</strong>
                   <small>{{ selectedProjectAccount ? selectedProjectAccount.note || '未填写备注' : `可用账号池 ${debugAccountPool.length} 个` }}</small>
@@ -3588,9 +4041,9 @@ watch(selectedTtsVoiceId, (value) => {
                 <div class="tts-account-card">
                   <span>任务响应</span>
                   <strong>{{ projectDisplayId }}</strong>
-                  <small>pid {{ projectDisplayPid }} · {{ projectLastFetchAt || '等待创建' }}</small>
+                  <small>{{ isUsingAutoVideo ? `event ${projectDisplayPid}` : `pid ${projectDisplayPid}` }} · {{ projectLastFetchAt || '等待创建' }}</small>
                 </div>
-                <div class="tts-account-card">
+                <div v-if="!isUsingAutoVideo" class="tts-account-card">
                   <span>字幕设置</span>
                   <strong>{{ subtitleSettingsSummary }}</strong>
                   <small>{{ projectSubtitleResult ? '本次任务已应用字幕设置' : '导出前会自动应用已保存配置' }}</small>
@@ -3601,24 +4054,24 @@ watch(selectedTtsVoiceId, (value) => {
                   <small>{{ projectStatusSummary }}</small>
                 </div>
                 <div class="tts-account-card">
-                  <span>项目进度</span>
-                  <strong>{{ projectResult?.pid ? `${projectProgressValue}%` : '--' }}</strong>
+                  <span>{{ isUsingAutoVideo ? '生成进度' : '项目进度' }}</span>
+                  <strong>{{ isUsingAutoVideo ? (projectResult?.video?.url ? '100%' : '--') : projectResult?.pid ? `${projectProgressValue}%` : '--' }}</strong>
                   <small>{{ projectStateText }} · 第 {{ projectPollCount || 0 }} 次</small>
                 </div>
                 <div class="tts-account-card">
-                  <span>导出进度</span>
-                  <strong>{{ projectExportTask?.task_id ? `${projectExportProgressValue}%` : '--' }}</strong>
+                  <span>{{ isUsingAutoVideo ? '视频地址' : '导出进度' }}</span>
+                  <strong>{{ isUsingAutoVideo ? (projectCanView ? '已生成' : '--') : projectExportTask?.task_id ? `${projectExportProgressValue}%` : '--' }}</strong>
                   <small>{{ projectExportStateText }} · 第 {{ projectExportPollCount || 0 }} 次</small>
                 </div>
                 <div class="tts-account-card">
-                  <span>导出任务</span>
-                  <strong>{{ projectExportTaskId }}</strong>
-                  <small>version {{ projectExportVersion }}</small>
+                  <span>{{ isUsingAutoVideo ? '成片链接' : '导出任务' }}</span>
+                  <strong>{{ isUsingAutoVideo ? (projectCanView ? '可查看' : '--') : projectExportTaskId }}</strong>
+                  <small>{{ isUsingAutoVideo ? (projectViewUrl || '生成完成后可复制') : `version ${projectExportVersion}` }}</small>
                 </div>
               </div>
 
               <div class="project-form-grid">
-                <label class="form-field project-field">
+                <label v-if="!isUsingAutoVideo" class="form-field project-field">
                   <span>发布账号</span>
                   <select v-model="projectForm.accountId">
                     <option value="">请选择发布账号</option>
@@ -3632,7 +4085,7 @@ watch(selectedTtsVoiceId, (value) => {
                   </select>
                 </label>
 
-                <label class="form-field project-field">
+                <label v-if="!isUsingAutoVideo" class="form-field project-field">
                   <span>任务名称</span>
                   <input
                     v-model="projectForm.name"
@@ -3641,7 +4094,7 @@ watch(selectedTtsVoiceId, (value) => {
                   />
                 </label>
 
-                <label class="form-field project-field">
+                <label v-if="!isUsingAutoVideo" class="form-field project-field">
                   <span>voice_id</span>
                   <input
                     v-model.number="projectForm.voiceId"
@@ -3655,7 +4108,7 @@ watch(selectedTtsVoiceId, (value) => {
                   </small>
                 </label>
 
-                <label class="form-field project-field">
+                <label v-if="!isUsingAutoVideo" class="form-field project-field">
                   <span>speech_rate</span>
                   <input
                     v-model.number="projectForm.speechRate"
@@ -3664,10 +4117,35 @@ watch(selectedTtsVoiceId, (value) => {
                     step="0.1"
                   />
                 </label>
+
+                <label v-if="isUsingAutoVideo" class="form-field project-field">
+                  <span>当前发音人</span>
+                  <input
+                    :value="getAutovideoVoiceLabel(autovideoSettings.voiceChoice)"
+                    type="text"
+                    readonly
+                  />
+                  <small class="project-field-hint">
+                    {{ autovideoSettings.voiceChoice || '请先到设置页选择发音人' }}
+                  </small>
+                </label>
+
+                <label v-if="isUsingAutoVideo" class="form-field project-field">
+                  <span>当前语速</span>
+                  <input
+                    :value="getAutovideoRateLabel(autovideoSettings.rateChoice)"
+                    type="text"
+                    readonly
+                  />
+                  <small class="project-field-hint">
+                    {{ autovideoSettings.rateChoice || '请先到设置页选择语速' }}
+                  </small>
+                </label>
               </div>
 
               <div class="project-actions">
                 <button
+                  v-if="!isUsingAutoVideo"
                   type="button"
                   class="toolbar-button secondary"
                   @click="openProjectVoicePicker"
@@ -3675,6 +4153,7 @@ watch(selectedTtsVoiceId, (value) => {
                   点击选择音色
                 </button>
                 <button
+                  v-if="!isUsingAutoVideo"
                   type="button"
                   class="toolbar-button secondary"
                   :disabled="!selectedTtsVoice"
@@ -3685,40 +4164,46 @@ watch(selectedTtsVoiceId, (value) => {
                 <button
                   type="button"
                   class="toolbar-button secondary"
-                  @click="switchSection('settings')"
+                  @click="isUsingAutoVideo ? openAutovideoSettingsTab() : switchSection('settings')"
                 >
-                  设置字幕
+                  {{ isUsingAutoVideo ? '设置发音人和语速' : '设置字幕' }}
                 </button>
-                <span class="project-hint">默认附带 `is_denoise=0`、`voice_type=0`、`project_type=0` 等固定参数，导出前会自动设置字幕。</span>
+                <span class="project-hint">
+                  {{
+                    isUsingAutoVideo
+                      ? 'AutoVideo 只提交分镜脚本、发音人和语速，生成完成后会直接返回成片地址。'
+                      : '默认附带 `is_denoise=0`、`voice_type=0`、`project_type=0` 等固定参数，导出前会自动设置字幕。'
+                  }}
+                </span>
               </div>
 
               <label class="form-field project-field">
-                <span>脚本文案</span>
+                <span>{{ isUsingAutoVideo ? '分镜脚本' : '脚本文案' }}</span>
                 <textarea
                   v-model="projectForm.script"
                   rows="14"
-                    placeholder="输入用于创建任务的完整文案"
+                  :placeholder="isUsingAutoVideo ? '每行一个分镜，例如：第一幕：镜头推进稻田。' : '输入用于创建任务的完整文案'"
                 />
               </label>
 
               <div class="tts-selection-bar">
                 <div>
                   <span>最近响应</span>
-                  <strong>{{ projectResult ? `id ${projectDisplayId}` : '暂无返回结果' }}</strong>
+                  <strong>{{ projectResult ? `${isUsingAutoVideo ? 'event' : 'id'} ${projectDisplayId}` : '暂无返回结果' }}</strong>
                 </div>
                 <div>
-                  <span>pid</span>
+                  <span>{{ isUsingAutoVideo ? 'event_id' : 'pid' }}</span>
                   <code>{{ projectDisplayPid }}</code>
                 </div>
                 <div>
-                  <span>项目状态</span>
+                  <span>{{ isUsingAutoVideo ? '生成状态' : '项目状态' }}</span>
                   <code>{{ projectStateText }}</code>
                 </div>
                 <div>
-                  <span>导出状态</span>
+                  <span>{{ isUsingAutoVideo ? '成片状态' : '导出状态' }}</span>
                   <code>{{ projectExportStateText }}</code>
                 </div>
-                <div>
+                <div v-if="!isUsingAutoVideo">
                   <span>字幕样式</span>
                   <code>{{ subtitleSettingsSummary }}</code>
                 </div>
@@ -3726,7 +4211,7 @@ watch(selectedTtsVoiceId, (value) => {
                   <button
                     type="button"
                     class="toolbar-button secondary"
-                    :disabled="!projectResult?.pid || projectLoading"
+                    :disabled="isUsingAutoVideo || !projectResult?.pid || projectLoading"
                     @click="refreshProjectProgress"
                   >
                     手动刷新状态
@@ -4110,8 +4595,8 @@ watch(selectedTtsVoiceId, (value) => {
             <div class="tts-lab-header">
               <div>
                 <p class="tts-caption">全局设置</p>
-                <h2>后台任务线程池</h2>
-                <p class="tts-description">应用启动后会每 5 秒扫描一次任务列表。S1 负责文章改写，S2 负责标题生成，这里的线程池大小会直接影响并发处理数量。</p>
+                <h2>生成渠道与后台任务</h2>
+                <p class="tts-description">这里决定视频生成使用花生还是 AutoVideo，并分别控制 S1 改写、S2 标题、S3 创建和 S4 扫描导出的并发数量。应用启动后会每 5 秒扫描一次任务列表。</p>
               </div>
               <div class="settings-toolbar">
                 <button
@@ -4135,14 +4620,95 @@ watch(selectedTtsVoiceId, (value) => {
 
             <section class="settings-block">
               <div class="settings-block-head">
-                <strong>线程池大小</strong>
-                <small>用于后台 S1 改写和 S2 标题生成的并发数量</small>
+                <strong>视频生成渠道</strong>
+                <small>花生保留账号池、字幕和导出链路；AutoVideo 直接根据分镜脚本生成成片</small>
               </div>
               <div class="settings-form-grid global-settings-grid">
                 <label class="form-field">
-                  <span>线程池大小</span>
+                  <span>生成渠道</span>
+                  <select v-model="globalSettings.generationProvider">
+                    <option value="huasheng">花生</option>
+                    <option value="autovideo">AutoVideo</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>下载策略</strong>
+                <small>开启后，任务一旦导出完成并且已配置下载目录，就会自动开始下载并在成功后删除任务</small>
+              </div>
+              <div class="settings-form-grid global-settings-grid">
+                <label class="form-field">
+                  <span>自动下载视频</span>
+                  <select v-model="globalSettings.autoDownloadVideos">
+                    <option :value="true">开启</option>
+                    <option :value="false">关闭</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>红线策略</strong>
+                <small>改写结果触发红线时，可选择保留任务状态供复查，或者直接自动删除任务</small>
+              </div>
+              <div class="settings-form-grid global-settings-grid">
+                <label class="form-field">
+                  <span>红线自动删除</span>
+                  <select v-model="globalSettings.autoDeleteRedlineTasks">
+                    <option :value="false">关闭</option>
+                    <option :value="true">开启</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>阶段线程池</strong>
+                <small>分别控制 S1 改写、S2 标题、S3 创建、S4 扫描导出的最大并发；总线程池会按四段之和自动计算</small>
+              </div>
+              <div class="settings-form-grid global-settings-grid">
+                <label class="form-field">
+                  <span>S1 改写线程池</span>
                   <input
-                    v-model.number="globalSettings.threadPoolSize"
+                    v-model.number="globalSettings.rewriteThreadPoolSize"
+                    type="number"
+                    min="1"
+                    max="32"
+                    step="1"
+                    placeholder="请输入 1 到 32"
+                  />
+                </label>
+                <label class="form-field">
+                  <span>S2 标题线程池</span>
+                  <input
+                    v-model.number="globalSettings.titleThreadPoolSize"
+                    type="number"
+                    min="1"
+                    max="32"
+                    step="1"
+                    placeholder="请输入 1 到 32"
+                  />
+                </label>
+                <label class="form-field">
+                  <span>S3 创建线程池</span>
+                  <input
+                    v-model.number="globalSettings.createThreadPoolSize"
+                    type="number"
+                    min="1"
+                    max="32"
+                    step="1"
+                    placeholder="请输入 1 到 32"
+                  />
+                </label>
+                <label class="form-field">
+                  <span>S4 扫描线程池</span>
+                  <input
+                    v-model.number="globalSettings.progressThreadPoolSize"
                     type="number"
                     min="1"
                     max="32"
@@ -4183,7 +4749,7 @@ watch(selectedTtsVoiceId, (value) => {
                     :disabled="globalSettingsLoading || globalSettingsSaving"
                     @click="clearGlobalDownloadDirectory"
                   >
-                    娓呯┖
+                    清空
                   </button>
                 </div>
               </div>
@@ -4267,19 +4833,34 @@ watch(selectedTtsVoiceId, (value) => {
             <section class="settings-block">
               <div class="tts-account-strip voice-settings-strip">
                 <div class="tts-account-card">
-                  <span>当前线程池</span>
-                  <strong>{{ normalizeGlobalThreadPoolSize(globalSettings.threadPoolSize) }}</strong>
-                  <small>建议按模型接口吞吐和机器性能调整</small>
+                  <span>当前渠道</span>
+                  <strong>{{ isUsingAutoVideo ? 'AutoVideo' : '花生' }}</strong>
+                  <small>{{ isUsingAutoVideo ? autovideoSettingsSummary : huashengVoiceSummary }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>总线程池</span>
+                  <strong>{{ getGlobalExecutorThreadPoolSize(globalSettings) }}</strong>
+                  <small>S1 {{ normalizeGlobalStageThreadPoolSize(globalSettings.rewriteThreadPoolSize) }} · S2 {{ normalizeGlobalStageThreadPoolSize(globalSettings.titleThreadPoolSize) }} · S3 {{ normalizeGlobalStageThreadPoolSize(globalSettings.createThreadPoolSize) }} · S4 {{ normalizeGlobalStageThreadPoolSize(globalSettings.progressThreadPoolSize) }}</small>
                 </div>
                 <div class="tts-account-card">
                   <span>扫描频率</span>
-                  <strong>5 绉</strong>
+                  <strong>5 秒</strong>
                   <small>应用启动后自动持续扫描任务列表</small>
                 </div>
                 <div class="tts-account-card">
                   <span>下载目录</span>
                   <strong>{{ getPathTail(globalSettings.downloadDir) }}</strong>
                   <small>{{ globalSettings.downloadDir || '还没有保存默认下载路径' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>自动下载</span>
+                  <strong>{{ globalSettings.autoDownloadVideos ? '已开启' : '已关闭' }}</strong>
+                  <small>导出完成后{{ globalSettings.autoDownloadVideos ? '自动开始下载' : '需手动点击下载' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>红线处理</span>
+                  <strong>{{ globalSettings.autoDeleteRedlineTasks ? '自动删除' : '保留任务' }}</strong>
+                  <small>{{ globalSettings.autoDeleteRedlineTasks ? '触发红线后直接删掉任务记录' : '触发红线后保留为“触发红线”状态' }}</small>
                 </div>
                 <div class="tts-account-card">
                   <span>最近保存</span>
@@ -4456,7 +5037,92 @@ watch(selectedTtsVoiceId, (value) => {
               </div>
             </section>
           </article>
-
+
+          <article
+            v-if="visitedSettingsTabs.autovideo"
+            v-show="activeSettingsTab === 'autovideo'"
+            class="tts-lab settings-panel"
+          >
+            <div class="tts-lab-header">
+              <div>
+                <p class="tts-caption">AutoVideo 设置</p>
+                <h2>发音人与语速</h2>
+                <p class="tts-description">当全局渠道切到 AutoVideo 时，创建任务页会直接读取这里保存的发音人和语速，不再走花生账号、字幕和导出流程。</p>
+              </div>
+              <div class="settings-toolbar">
+                <button
+                  type="button"
+                  class="toolbar-button secondary"
+                  :disabled="autovideoSettingsLoading || !desktopReady"
+                  @click="loadAutovideoSettings('AutoVideo 设置已刷新')"
+                >
+                  {{ autovideoSettingsLoading ? '刷新中...' : '从数据库刷新' }}
+                </button>
+                <button
+                  type="button"
+                  class="tts-primary-button settings-save-button"
+                  :disabled="autovideoSettingsSaving || autovideoSettingsLoading || !desktopReady"
+                  @click="saveAutovideoSettings"
+                >
+                  {{ autovideoSettingsSaving ? '保存中...' : '保存 AutoVideo 设置' }}
+                </button>
+              </div>
+            </div>
+
+            <section class="settings-block">
+              <div class="settings-block-head">
+                <strong>生成参数</strong>
+                <small>参数来自你提供的 AutoVideo API 页面，可直接下拉选择</small>
+              </div>
+              <div class="settings-form-grid">
+                <label class="form-field">
+                  <span>发音人</span>
+                  <select v-model="autovideoSettings.voiceChoice">
+                    <option
+                      v-for="option in autovideoVoiceOptions"
+                      :key="option.value"
+                      :value="option.value"
+                    >
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+                <label class="form-field">
+                  <span>语速</span>
+                  <select v-model="autovideoSettings.rateChoice">
+                    <option
+                      v-for="option in autovideoRateOptions"
+                      :key="option.value"
+                      :value="option.value"
+                    >
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-block">
+              <div class="tts-account-strip voice-settings-strip">
+                <div class="tts-account-card">
+                  <span>当前发音人</span>
+                  <strong>{{ getAutovideoVoiceLabel(autovideoSettings.voiceChoice) }}</strong>
+                  <small>{{ autovideoSettings.voiceChoice || '--' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>当前语速</span>
+                  <strong>{{ getAutovideoRateLabel(autovideoSettings.rateChoice) }}</strong>
+                  <small>{{ autovideoSettings.rateChoice || '--' }}</small>
+                </div>
+                <div class="tts-account-card">
+                  <span>最近保存</span>
+                  <strong>{{ autovideoSettingsLastSavedAt || '--' }}</strong>
+                  <small>{{ autovideoSettingsSummary }}</small>
+                </div>
+              </div>
+            </section>
+          </article>
+
 
           <MicroheadlineSettingsPanel
             v-if="visitedSettingsTabs.microheadline"

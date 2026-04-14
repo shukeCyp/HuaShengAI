@@ -52,6 +52,7 @@ class TaskRecord(BaseModel):
     account_phone = CharField(max_length=32, default="")
     account_note = CharField(max_length=255, default="")
     account_cookies = TextField(default="")
+    generation_provider = CharField(max_length=32, default="huasheng")
     project_pid = CharField(max_length=64, default="", index=True)
     article_id = IntegerField(null=True, index=True)
     article_content = TextField(default="")

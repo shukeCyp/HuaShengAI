@@ -15,6 +15,7 @@ from app.models import (
     HuashengGenerationRecord,
     MonitorRun,
     MonitoredArticle,
+    TaskRecord,
 )
 
 
@@ -216,23 +217,76 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
     def test_get_global_settings_payload_creates_default_settings(self) -> None:
         payload = self.service.get_global_settings_payload()
 
-        self.assertEqual(payload["settings"]["threadPoolSize"], 3)
+        self.assertEqual(payload["settings"]["threadPoolSize"], 8)
         self.assertEqual(payload["settings"]["downloadDir"], "")
+        self.assertEqual(payload["settings"]["generationProvider"], "huasheng")
+        self.assertFalse(payload["settings"]["autoDownloadVideos"])
+        self.assertFalse(payload["settings"]["autoDeleteRedlineTasks"])
+        self.assertEqual(payload["settings"]["rewriteThreadPoolSize"], 3)
+        self.assertEqual(payload["settings"]["titleThreadPoolSize"], 3)
+        self.assertEqual(payload["settings"]["createThreadPoolSize"], 1)
+        self.assertEqual(payload["settings"]["progressThreadPoolSize"], 1)
         self.assertEqual(payload["scanIntervalSeconds"], 5)
         self.assertEqual(payload["threadPoolMinSize"], 1)
         self.assertEqual(payload["threadPoolMaxSize"], 32)
+        self.assertEqual(payload["executorThreadPoolMaxSize"], 128)
         self.assertFalse(payload["processorRunning"])
         self.assertEqual(payload["databasePath"], str(self.db_path))
 
     def test_save_global_settings_persists_thread_pool_size(self) -> None:
         download_dir = Path(self.temp_dir.name) / "downloads"
-        saved = self.service.save_global_settings(6, str(download_dir))
+        saved = self.service.save_global_settings(
+            10,
+            str(download_dir),
+            "autovideo",
+            True,
+            True,
+            4,
+            3,
+            2,
+            1,
+        )
         loaded = self.service.get_global_settings_payload()
 
-        self.assertEqual(saved["settings"]["threadPoolSize"], 6)
+        self.assertEqual(saved["settings"]["threadPoolSize"], 10)
         self.assertEqual(saved["settings"]["downloadDir"], str(download_dir.resolve()))
-        self.assertEqual(loaded["settings"]["threadPoolSize"], 6)
+        self.assertEqual(saved["settings"]["generationProvider"], "autovideo")
+        self.assertTrue(saved["settings"]["autoDownloadVideos"])
+        self.assertTrue(saved["settings"]["autoDeleteRedlineTasks"])
+        self.assertEqual(saved["settings"]["rewriteThreadPoolSize"], 4)
+        self.assertEqual(saved["settings"]["titleThreadPoolSize"], 3)
+        self.assertEqual(saved["settings"]["createThreadPoolSize"], 2)
+        self.assertEqual(saved["settings"]["progressThreadPoolSize"], 1)
+        self.assertEqual(loaded["settings"]["threadPoolSize"], 10)
         self.assertEqual(loaded["settings"]["downloadDir"], str(download_dir.resolve()))
+        self.assertEqual(loaded["settings"]["generationProvider"], "autovideo")
+        self.assertTrue(loaded["settings"]["autoDownloadVideos"])
+        self.assertTrue(loaded["settings"]["autoDeleteRedlineTasks"])
+        self.assertEqual(loaded["settings"]["rewriteThreadPoolSize"], 4)
+        self.assertEqual(loaded["settings"]["titleThreadPoolSize"], 3)
+        self.assertEqual(loaded["settings"]["createThreadPoolSize"], 2)
+        self.assertEqual(loaded["settings"]["progressThreadPoolSize"], 1)
+
+    def test_get_autovideo_settings_payload_creates_default_settings(self) -> None:
+        payload = self.service.get_autovideo_settings_payload()
+
+        self.assertEqual(payload["settings"]["voiceChoice"], "zh-CN-YunyangNeural")
+        self.assertEqual(payload["settings"]["rateChoice"], "+20%")
+        self.assertTrue(payload["voiceOptions"])
+        self.assertTrue(payload["rateOptions"])
+        self.assertEqual(payload["databasePath"], str(self.db_path))
+
+    def test_save_autovideo_settings_persists_voice_and_rate(self) -> None:
+        saved = self.service.save_autovideo_settings(
+            "zh-CN-XiaoxiaoNeural",
+            "+10%",
+        )
+        loaded = self.service.get_autovideo_settings_payload()
+
+        self.assertEqual(saved["settings"]["voiceChoice"], "zh-CN-XiaoxiaoNeural")
+        self.assertEqual(saved["settings"]["rateChoice"], "+10%")
+        self.assertEqual(loaded["settings"]["voiceChoice"], "zh-CN-XiaoxiaoNeural")
+        self.assertEqual(loaded["settings"]["rateChoice"], "+10%")
 
     def test_get_log_status_payload_reports_log_directory_file_count_and_size(self) -> None:
         log_dir = self.service.resolve_log_directory_path()
@@ -554,6 +608,13 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized, "第一段\n第二段")
+
+    def test_normalize_rewrite_response_text_removes_markdown_hash_and_asterisk(self) -> None:
+        normalized = self.service.normalize_rewrite_response_text(
+            "############content\n# 第一段\n**重点内容**\n* 列表项"
+        )
+
+        self.assertEqual(normalized, "第一段\n重点内容\n列表项")
 
     def test_rewrite_article_marks_redline_response(self) -> None:
         settings = self.service.save_model_settings(
@@ -1028,6 +1089,117 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["articlePreview"], "文章 101 单篇正文")
         self.assertEqual(payload["items"][0]["rewritePromptId"], prompt_id)
 
+    def test_create_single_article_processing_task_does_not_require_huasheng_account_for_autovideo(self) -> None:
+        self.service.save_global_settings(3, "", "autovideo")
+        self.create_monitored_article(101, content="文章 101 单篇正文", play_count=1000)
+        settings = self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "标题提示词",
+            [
+                "提示词一",
+            ],
+        )
+        prompt_id = settings["prompts"][0]["id"]
+
+        payload = self.service.create_single_article_processing_task(101, prompt_id)
+
+        self.assertEqual(payload["createdCount"], 1)
+        self.assertEqual(payload["accountId"], 0)
+        self.assertEqual(payload["generationProvider"], "autovideo")
+        self.assertEqual(payload["items"][0]["generationProvider"], "autovideo")
+        self.assertEqual(payload["items"][0]["accountId"], 0)
+
+    def test_run_title_task_uses_autovideo_next_status_when_provider_is_autovideo(self) -> None:
+        self.service.save_global_settings(3, "", "autovideo")
+        self.service.save_model_settings(
+            "https://api.example.com/v1",
+            "secret-token",
+            "gpt-5.4",
+            "标题提示词",
+            ["提示词一"],
+        )
+        with database.connection_context():
+            task = TaskRecord.create(
+                account_id=0,
+                account_phone="",
+                account_note="AutoVideo",
+                account_cookies="",
+                generation_provider="autovideo",
+                project_pid="",
+                article_id=101,
+                article_content="原始文章",
+                rewritten_content="改写后的正文内容",
+                title="",
+                rewrite_prompt_id=1,
+                rewrite_prompt="提示词一",
+                progress=0,
+                status="待生成标题",
+                huasheng_status="未创建",
+                video_url="",
+                export_task_id="",
+                export_version="",
+            )
+
+        with patch.object(
+            self.service,
+            "generate_title",
+            return_value={"title": "自动生成标题"},
+        ):
+            self.service._run_title_task(int(task.id))
+
+        refreshed = self.service.get_task_record(int(task.id))
+        self.assertEqual(refreshed.status, "待生成视频")
+        self.assertEqual(refreshed.title, "自动生成标题")
+
+    def test_run_huasheng_create_task_generates_video_directly_for_autovideo(self) -> None:
+        with database.connection_context():
+            task = TaskRecord.create(
+                account_id=0,
+                account_phone="",
+                account_note="AutoVideo",
+                account_cookies="",
+                generation_provider="autovideo",
+                project_pid="",
+                article_id=101,
+                article_content="原始文章",
+                rewritten_content="第一幕阳光照进院子。第二幕孩子跑向门口。",
+                title="自动生成标题",
+                rewrite_prompt_id=1,
+                rewrite_prompt="提示词一",
+                progress=0,
+                status="待生成视频",
+                huasheng_status="未创建",
+                video_url="",
+                export_task_id="",
+                export_version="",
+            )
+
+        self.service.save_autovideo_settings("zh-CN-YunyangNeural", "+20%")
+
+        with patch.object(
+            self.service._autovideo,
+            "generate_video",
+            return_value={
+                "eventId": "autovideo-event-1",
+                "viewUrl": "https://autovideo.talkus.fun/video.mp4",
+                "statusMessage": "生成成功",
+            },
+        ) as mocked_generate:
+            self.service._run_huasheng_create_task(int(task.id))
+
+        refreshed = self.service.get_task_record(int(task.id))
+        mocked_generate.assert_called_once_with(
+            story_text="第一幕阳光照进院子。第二幕孩子跑向门口。",
+            voice_choice="zh-CN-YunyangNeural",
+            rate_choice="+20%",
+        )
+        self.assertEqual(refreshed.status, "导出完成")
+        self.assertEqual(refreshed.project_pid, "autovideo-event-1")
+        self.assertEqual(refreshed.video_url, "https://autovideo.talkus.fun/video.mp4")
+        self.assertEqual(refreshed.huasheng_status, "生成成功")
+
     def test_list_tasks_payload_orders_by_id_desc(self) -> None:
         self.service.create_account(
             "13800138000",
@@ -1280,6 +1452,37 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             task.huasheng_status,
             "模型网关兼容异常：finish_reason=stop，但未返回正文内容。",
         )
+
+    def test_run_rewrite_task_auto_deletes_task_when_redline_toggle_is_enabled(self) -> None:
+        account = self.service.create_account(
+            "13800138000",
+            "SESSDATA=test; bili_jct=csrf",
+            "测试账号",
+            False,
+        )
+        self.service.save_global_settings(8, "", "huasheng", False, True, 3, 3, 1, 1)
+        created = self.service.create_task_record(
+            account["id"],
+            "",
+            "待处理",
+            article_id=101,
+            article_content="原始文章内容",
+            rewrite_prompt_id=1,
+            rewrite_prompt="提示词A",
+            huasheng_status="未创建",
+        )
+
+        with patch.object(
+            self.service,
+            "rewrite_article_with_prompt",
+            return_value={
+                "content": "触发红线，禁止改写",
+                "triggeredRedline": True,
+            },
+        ):
+            self.service._run_rewrite_task(created["id"])
+
+        self.assertIsNone(self.service.find_task_record(created["id"]))
 
     def test_finalize_submitted_task_suppresses_duplicate_warning_for_logged_stage_failure(self) -> None:
         future: Future[None] = Future()
@@ -1842,6 +2045,15 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             "发布账号A",
             False,
         )
+        self.service.save_huasheng_voice_settings(
+            6036542,
+            "知性女声",
+            "voice-code",
+            "科普",
+            "https://example.com/preview.mp3",
+            "https://example.com/cover.png",
+            1.1,
+        )
         created = self.service.create_task_record(
             account["id"],
             "113671485575170",
@@ -1871,6 +2083,10 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             return_value={"code": 0, "message": "success"},
         ) as mocked_edit_project, patch.object(
             self.service._huasheng,
+            "edit_project_tts_settings",
+            return_value={"code": 0, "message": "success"},
+        ) as mocked_edit_project_tts_settings, patch.object(
+            self.service._huasheng,
             "export_project_video",
             return_value={"task_id": "p2470002_37", "version": "37"},
         ) as mocked_export_project, patch.object(
@@ -1898,6 +2114,12 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             font_color="#FFFFFF",
             outline_color="#0091A8",
             outline_thick=70,
+        )
+        mocked_edit_project_tts_settings.assert_called_once_with(
+            "SESSDATA=test; bili_jct=csrf-token; sid=abc",
+            project_id=2470002,
+            voice_id=6036542,
+            speech_rate=1.1,
         )
         mocked_export_project.assert_called_once_with(
             "SESSDATA=test; bili_jct=csrf-token; sid=abc",
@@ -2185,6 +2407,75 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertNotIn(finished_task["id"], huasheng_create_ids)
         self.assertNotIn(finished_task["id"], huasheng_progress_ids)
         self.assertNotIn(finished_status_task["id"], huasheng_progress_ids)
+
+    def test_process_task_queue_once_respects_stage_thread_pool_limits(self) -> None:
+        with (
+            patch.object(
+                self.service,
+                "get_global_settings_payload",
+                return_value={
+                    "settings": {
+                        "threadPoolSize": 10,
+                        "downloadDir": "",
+                        "generationProvider": "huasheng",
+                        "autoDownloadVideos": False,
+                        "autoDeleteRedlineTasks": False,
+                        "rewriteThreadPoolSize": 2,
+                        "titleThreadPoolSize": 3,
+                        "createThreadPoolSize": 1,
+                        "progressThreadPoolSize": 2,
+                    }
+                },
+            ),
+            patch.object(
+                self.service,
+                "get_model_settings_payload",
+                return_value={
+                    "settings": {
+                        "baseUrl": "https://api.example.com/v1",
+                        "apiKey": "secret-token",
+                        "model": "gpt-5.4",
+                        "titlePrompt": "标题提示词",
+                    }
+                },
+            ),
+            patch.object(self.service, "has_model_connection_settings", return_value=True),
+            patch.object(self.service, "list_pending_rewrite_task_ids", return_value=[1, 2, 3, 4]),
+            patch.object(self.service, "list_pending_title_task_ids", return_value=[11, 12, 13, 14]),
+            patch.object(self.service, "list_pending_huasheng_create_task_ids", return_value=[21, 22]),
+            patch.object(self.service, "list_pending_huasheng_progress_task_ids", return_value=[31, 32, 33]),
+            patch.object(self.service, "submit_rewrite_task", return_value=True) as mocked_submit_rewrite,
+            patch.object(self.service, "submit_title_task", return_value=True) as mocked_submit_title,
+            patch.object(self.service, "submit_huasheng_create_task", return_value=True) as mocked_submit_create,
+            patch.object(self.service, "submit_huasheng_progress_task", return_value=True) as mocked_submit_progress,
+        ):
+            self.service._rewrite_task_ids_inflight = {90}
+            self.service._title_task_ids_inflight = set()
+            self.service._huasheng_create_task_ids_inflight = set()
+            self.service._huasheng_progress_task_ids_inflight = {80}
+
+            payload = self.service.process_task_queue_once()
+
+        self.assertEqual(payload["rewriteSubmitted"], 1)
+        self.assertEqual(payload["titleSubmitted"], 3)
+        self.assertEqual(payload["huashengCreateSubmitted"], 1)
+        self.assertEqual(payload["huashengProgressSubmitted"], 1)
+        self.assertEqual(
+            [call.args[0] for call in mocked_submit_rewrite.call_args_list],
+            [1],
+        )
+        self.assertEqual(
+            [call.args[0] for call in mocked_submit_title.call_args_list],
+            [11, 12, 13],
+        )
+        self.assertEqual(
+            [call.args[0] for call in mocked_submit_create.call_args_list],
+            [21],
+        )
+        self.assertEqual(
+            [call.args[0] for call in mocked_submit_progress.call_args_list],
+            [31],
+        )
 
 
 if __name__ == "__main__":
