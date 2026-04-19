@@ -22,6 +22,7 @@ const DEFAULT_MODEL_SETTINGS = {
 }
 const DEFAULT_GLOBAL_SETTINGS = {
   threadPoolSize: 8,
+  downloadThreadPoolSize: 1,
   downloadDir: '',
   generationProvider: 'huasheng',
   autoDownloadVideos: false,
@@ -678,9 +679,10 @@ const globalSettingsSummary = computed(() => {
   const downloadLabel = globalSettings.downloadDir ? '已设置下载目录' : '未设置下载目录'
   const providerLabel = isUsingAutoVideo.value ? 'AutoVideo' : '花生'
   const autoDownloadLabel = globalSettings.autoDownloadVideos ? '自动下载已开启' : '自动下载已关闭'
+  const downloadThreadLabel = `下载线程 ${normalizeGlobalStageThreadPoolSize(globalSettings.downloadThreadPoolSize, DEFAULT_GLOBAL_SETTINGS.downloadThreadPoolSize)}`
   const redlineLabel = globalSettings.autoDeleteRedlineTasks ? '红线自动删除' : '红线保留任务'
   const stageLabel = `S1 ${normalizeGlobalStageThreadPoolSize(globalSettings.rewriteThreadPoolSize)} / S2 ${normalizeGlobalStageThreadPoolSize(globalSettings.titleThreadPoolSize)} / S3 ${normalizeGlobalStageThreadPoolSize(globalSettings.createThreadPoolSize)} / S4 ${normalizeGlobalStageThreadPoolSize(globalSettings.progressThreadPoolSize)}`
-  return `${providerLabel} · 总线程 ${getGlobalExecutorThreadPoolSize(globalSettings)} · ${stageLabel} · ${downloadLabel} · ${autoDownloadLabel} · ${redlineLabel}`
+  return `${providerLabel} · 总线程 ${getGlobalExecutorThreadPoolSize(globalSettings)} · ${stageLabel} · ${downloadThreadLabel} · ${downloadLabel} · ${autoDownloadLabel} · ${redlineLabel}`
 })
 
 const autovideoSettingsSummary = computed(() => {
@@ -1408,6 +1410,10 @@ function applyGlobalSettingsPayload(payload) {
     settings.progressThreadPoolSize,
     DEFAULT_GLOBAL_SETTINGS.progressThreadPoolSize
   )
+  globalSettings.downloadThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+    settings.downloadThreadPoolSize,
+    DEFAULT_GLOBAL_SETTINGS.downloadThreadPoolSize
+  )
   globalSettings.threadPoolSize = getGlobalExecutorThreadPoolSize(globalSettings)
   globalSettings.downloadDir = normalizeGlobalDownloadDir(settings.downloadDir)
   globalSettings.generationProvider = normalizeGenerationProvider(settings.generationProvider)
@@ -1510,6 +1516,10 @@ async function saveGlobalSettings() {
       globalSettings.progressThreadPoolSize,
       DEFAULT_GLOBAL_SETTINGS.progressThreadPoolSize
     )
+    const downloadThreadPoolSize = normalizeGlobalStageThreadPoolSize(
+      globalSettings.downloadThreadPoolSize,
+      DEFAULT_GLOBAL_SETTINGS.downloadThreadPoolSize
+    )
     const payload = await callDesktop(
       'save_global_settings',
       rewriteThreadPoolSize + titleThreadPoolSize + createThreadPoolSize + progressThreadPoolSize,
@@ -1520,7 +1530,8 @@ async function saveGlobalSettings() {
       rewriteThreadPoolSize,
       titleThreadPoolSize,
       createThreadPoolSize,
-      progressThreadPoolSize
+      progressThreadPoolSize,
+      downloadThreadPoolSize
     )
     applyGlobalSettingsPayload(payload)
     if (globalSettings.generationProvider === 'autovideo' && !autovideoSettingsLoaded.value) {
@@ -4637,7 +4648,7 @@ watch(
             <section class="settings-block">
               <div class="settings-block-head">
                 <strong>下载策略</strong>
-                <small>开启后，任务一旦导出完成并且已配置下载目录，就会自动开始下载并在成功后删除任务</small>
+                <small>开启后，任务一旦导出完成并且已配置下载目录，就会自动开始下载并在成功后删除任务；下载线程池同时约束手动下载和自动下载并发</small>
               </div>
               <div class="settings-form-grid global-settings-grid">
                 <label class="form-field">
@@ -4646,6 +4657,17 @@ watch(
                     <option :value="true">开启</option>
                     <option :value="false">关闭</option>
                   </select>
+                </label>
+                <label class="form-field">
+                  <span>下载线程池</span>
+                  <input
+                    v-model.number="globalSettings.downloadThreadPoolSize"
+                    type="number"
+                    min="1"
+                    max="32"
+                    step="1"
+                    placeholder="请输入 1 到 32"
+                  />
                 </label>
               </div>
             </section>
@@ -4855,7 +4877,7 @@ watch(
                 <div class="tts-account-card">
                   <span>自动下载</span>
                   <strong>{{ globalSettings.autoDownloadVideos ? '已开启' : '已关闭' }}</strong>
-                  <small>导出完成后{{ globalSettings.autoDownloadVideos ? '自动开始下载' : '需手动点击下载' }}</small>
+                  <small>导出完成后{{ globalSettings.autoDownloadVideos ? '自动开始下载' : '需手动点击下载' }} · 下载线程 {{ normalizeGlobalStageThreadPoolSize(globalSettings.downloadThreadPoolSize, DEFAULT_GLOBAL_SETTINGS.downloadThreadPoolSize) }}</small>
                 </div>
                 <div class="tts-account-card">
                   <span>红线处理</span>

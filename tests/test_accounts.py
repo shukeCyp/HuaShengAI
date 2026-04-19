@@ -218,6 +218,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         payload = self.service.get_global_settings_payload()
 
         self.assertEqual(payload["settings"]["threadPoolSize"], 8)
+        self.assertEqual(payload["settings"]["downloadThreadPoolSize"], 1)
         self.assertEqual(payload["settings"]["downloadDir"], "")
         self.assertEqual(payload["settings"]["generationProvider"], "huasheng")
         self.assertFalse(payload["settings"]["autoDownloadVideos"])
@@ -245,10 +246,12 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
             3,
             2,
             1,
+            5,
         )
         loaded = self.service.get_global_settings_payload()
 
         self.assertEqual(saved["settings"]["threadPoolSize"], 10)
+        self.assertEqual(saved["settings"]["downloadThreadPoolSize"], 5)
         self.assertEqual(saved["settings"]["downloadDir"], str(download_dir.resolve()))
         self.assertEqual(saved["settings"]["generationProvider"], "autovideo")
         self.assertTrue(saved["settings"]["autoDownloadVideos"])
@@ -258,6 +261,7 @@ class AccountServiceSubtitleSettingsTests(unittest.TestCase):
         self.assertEqual(saved["settings"]["createThreadPoolSize"], 2)
         self.assertEqual(saved["settings"]["progressThreadPoolSize"], 1)
         self.assertEqual(loaded["settings"]["threadPoolSize"], 10)
+        self.assertEqual(loaded["settings"]["downloadThreadPoolSize"], 5)
         self.assertEqual(loaded["settings"]["downloadDir"], str(download_dir.resolve()))
         self.assertEqual(loaded["settings"]["generationProvider"], "autovideo")
         self.assertTrue(loaded["settings"]["autoDownloadVideos"])

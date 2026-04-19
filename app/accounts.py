@@ -109,6 +109,7 @@ DEFAULT_MODEL_SETTINGS = {
 }
 DEFAULT_GLOBAL_SETTINGS = {
     "threadPoolSize": 8,
+    "downloadThreadPoolSize": 1,
     "downloadDir": "",
     "generationProvider": "huasheng",
     "autoDownloadVideos": False,
@@ -1085,6 +1086,7 @@ class AccountService:
         title_thread_pool_size: int | None = None,
         create_thread_pool_size: int | None = None,
         progress_thread_pool_size: int | None = None,
+        download_thread_pool_size: int | None = None,
     ) -> dict[str, Any]:
         settings_input: dict[str, Any] = {
             "threadPoolSize": thread_pool_size,
@@ -1115,6 +1117,13 @@ class AccountService:
             )
         else:
             settings_input["autoDeleteRedlineTasks"] = auto_delete_redline_tasks
+        if download_thread_pool_size is None:
+            settings_input["downloadThreadPoolSize"] = existing_settings.get(
+                "downloadThreadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["downloadThreadPoolSize"],
+            )
+        else:
+            settings_input["downloadThreadPoolSize"] = download_thread_pool_size
         if rewrite_thread_pool_size is None:
             settings_input["rewriteThreadPoolSize"] = existing_settings.get(
                 "rewriteThreadPoolSize",
@@ -3207,6 +3216,13 @@ class AccountService:
                 DEFAULT_GLOBAL_SETTINGS["progressThreadPoolSize"],
             )
         )
+        download_thread_pool_size = self.normalize_thread_pool_size(
+            settings.get(
+                "downloadThreadPoolSize",
+                DEFAULT_GLOBAL_SETTINGS["downloadThreadPoolSize"],
+            ),
+            fallback=DEFAULT_GLOBAL_SETTINGS["downloadThreadPoolSize"],
+        )
         return {
             "threadPoolSize": self.normalize_executor_thread_pool_size(
                 rewrite_thread_pool_size
@@ -3214,6 +3230,7 @@ class AccountService:
                 + create_thread_pool_size
                 + progress_thread_pool_size
             ),
+            "downloadThreadPoolSize": download_thread_pool_size,
             "downloadDir": self.normalize_download_directory(
                 settings.get("downloadDir")
             ),
@@ -3245,11 +3262,15 @@ class AccountService:
             self.get_global_settings_payload()["settings"].get("generationProvider")
         )
 
-    def normalize_thread_pool_size(self, value: Any) -> int:
+    def normalize_thread_pool_size(self, value: Any, *, fallback: int | None = None) -> int:
         try:
             normalized = int(value)
         except (TypeError, ValueError):
-            normalized = DEFAULT_GLOBAL_SETTINGS["threadPoolSize"]
+            normalized = (
+                DEFAULT_GLOBAL_SETTINGS["threadPoolSize"]
+                if fallback is None
+                else int(fallback)
+            )
 
         if normalized < TASK_THREAD_POOL_MIN_SIZE:
             return TASK_THREAD_POOL_MIN_SIZE

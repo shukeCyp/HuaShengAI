@@ -138,6 +138,7 @@ class AppApiModelActionTests(unittest.TestCase):
             return_value={
                 "settings": {
                     "threadPoolSize": 10,
+                    "downloadThreadPoolSize": 5,
                     "downloadDir": "/tmp/downloads",
                     "generationProvider": "autovideo",
                     "autoDownloadVideos": True,
@@ -159,6 +160,7 @@ class AppApiModelActionTests(unittest.TestCase):
                 3,
                 2,
                 1,
+                5,
             )
 
         mocked_save.assert_called_once_with(
@@ -171,8 +173,10 @@ class AppApiModelActionTests(unittest.TestCase):
             3,
             2,
             1,
+            5,
         )
         self.assertEqual(payload["settings"]["downloadDir"], "/tmp/downloads")
+        self.assertEqual(payload["settings"]["downloadThreadPoolSize"], 5)
         self.assertEqual(payload["settings"]["generationProvider"], "autovideo")
         self.assertTrue(payload["settings"]["autoDownloadVideos"])
         self.assertTrue(payload["settings"]["autoDeleteRedlineTasks"])
@@ -249,12 +253,12 @@ class AppApiModelActionTests(unittest.TestCase):
     def test_start_download_task_video_publishes_started_event(self) -> None:
         with (
             patch.object(self.bridge, "publish_event") as mocked_publish,
-            patch("app.bridge.Thread") as mocked_thread,
+            patch.object(self.api, "_submit_download_task") as mocked_submit,
         ):
             payload = self.api.start_download_task_video(8)
 
         mocked_publish.assert_called_once()
-        mocked_thread.assert_called_once()
+        mocked_submit.assert_called_once_with(8)
         self.assertTrue(payload["started"])
         self.assertFalse(payload["alreadyRunning"])
         self.assertEqual(payload["taskId"], 8)

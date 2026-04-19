@@ -5,9 +5,10 @@ import logging
 import platform
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock
 from typing import Any, Callable
 
 import webview
@@ -268,6 +269,9 @@ class AppApi:
         self._microheadline = microheadline or MicroHeadlineService(account_service.db_path)
         self._download_task_ids_lock = Lock()
         self._download_task_ids_inflight: set[int] = set()
+        self._download_executor_lock = Lock()
+        self._download_executor: ThreadPoolExecutor | None = None
+        self._download_executor_size = 0
 
     def ping(self) -> dict[str, Any]:
         response = {
@@ -341,12 +345,12 @@ class AppApi:
                 "databasePath": str(self._account_service.db_path),
             },
         )
-        Thread(
-            target=self._run_task_video_download_worker,
-            args=(normalized_task_id,),
-            name=f"task-video-download-{normalized_task_id}",
-            daemon=True,
-        ).start()
+        try:
+            self._submit_download_task(normalized_task_id)
+        except Exception:
+            with self._download_task_ids_lock:
+                self._download_task_ids_inflight.discard(normalized_task_id)
+            raise
         return {
             "taskId": normalized_task_id,
             "started": True,
@@ -385,6 +389,46 @@ class AppApi:
         finally:
             with self._download_task_ids_lock:
                 self._download_task_ids_inflight.discard(task_id)
+
+    def _submit_download_task(self, task_id: int) -> None:
+        self._ensure_download_executor()
+        with self._download_executor_lock:
+            executor = self._download_executor
+        if executor is None:
+            raise RuntimeError("下载线程池未初始化。")
+        executor.submit(self._run_task_video_download_worker, task_id)
+
+    def _ensure_download_executor(self) -> None:
+        with self._download_executor_lock:
+            if self._download_executor is not None:
+                return
+        settings = self._account_service.get_global_settings_payload()["settings"]
+        self._configure_download_executor(settings.get("downloadThreadPoolSize"))
+
+    def _configure_download_executor(self, download_thread_pool_size: Any) -> None:
+        normalized_size = self._account_service.normalize_thread_pool_size(
+            download_thread_pool_size,
+            fallback=1,
+        )
+        old_executor: ThreadPoolExecutor | None = None
+        with self._download_executor_lock:
+            if (
+                self._download_executor is not None
+                and self._download_executor_size == normalized_size
+            ):
+                return
+            old_executor = self._download_executor
+            self._download_executor = ThreadPoolExecutor(
+                max_workers=normalized_size,
+                thread_name_prefix="task-video-download",
+            )
+            self._download_executor_size = normalized_size
+        if old_executor is not None:
+            old_executor.shutdown(wait=False, cancel_futures=False)
+        logger.info(
+            "AppApi download executor ready download_thread_pool_size=%s",
+            normalized_size,
+        )
 
 
     def create_task_record(
@@ -457,9 +501,10 @@ class AppApi:
         title_thread_pool_size: int | None = None,
         create_thread_pool_size: int | None = None,
         progress_thread_pool_size: int | None = None,
+        download_thread_pool_size: int | None = None,
     ) -> dict[str, Any]:
         logger.info(
-            "AppApi.save_global_settings called thread_pool_size=%s download_dir_length=%s generation_provider=%s auto_download_videos=%s auto_delete_redline_tasks=%s rewrite_thread_pool_size=%s title_thread_pool_size=%s create_thread_pool_size=%s progress_thread_pool_size=%s",
+            "AppApi.save_global_settings called thread_pool_size=%s download_dir_length=%s generation_provider=%s auto_download_videos=%s auto_delete_redline_tasks=%s rewrite_thread_pool_size=%s title_thread_pool_size=%s create_thread_pool_size=%s progress_thread_pool_size=%s download_thread_pool_size=%s",
             thread_pool_size,
             len(str(download_dir or "")),
             str(generation_provider or ""),
@@ -469,8 +514,9 @@ class AppApi:
             title_thread_pool_size,
             create_thread_pool_size,
             progress_thread_pool_size,
+            download_thread_pool_size,
         )
-        return self._account_service.save_global_settings(
+        payload = self._account_service.save_global_settings(
             thread_pool_size,
             None if download_dir is None else str(download_dir),
             None if generation_provider is None else str(generation_provider),
@@ -480,7 +526,12 @@ class AppApi:
             title_thread_pool_size,
             create_thread_pool_size,
             progress_thread_pool_size,
+            download_thread_pool_size,
         )
+        self._configure_download_executor(
+            payload.get("settings", {}).get("downloadThreadPoolSize")
+        )
+        return payload
 
     def get_log_status(self) -> dict[str, Any]:
         logger.info("AppApi.get_log_status called")
